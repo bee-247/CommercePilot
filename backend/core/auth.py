@@ -1,0 +1,160 @@
+import os
+import base64
+import hashlib
+import hmac
+from datetime import datetime, timedelta, timezone
+
+from fastapi import Depends, HTTPException, status
+from fastapi.security import OAuth2PasswordBearer
+from jose import JWTError, jwt
+from sqlalchemy.orm import Session
+
+from core.env import load_project_env
+from rag.storage.database import SessionLocal
+from rag.storage.models import User
+
+load_project_env()
+
+SECRET_KEY = os.getenv("JWT_SECRET_KEY", "")
+ALGORITHM = os.getenv("JWT_ALGORITHM", "HS256")
+ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("JWT_EXPIRE_MINUTES", "1440"))
+PBKDF2_ROUNDS = int(os.getenv("PASSWORD_PBKDF2_ROUNDS", "310000"))
+
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/rag/auth/login")
+
+
+def _validated_secret_key() -> str:
+    if len(SECRET_KEY) < 32:
+        raise RuntimeError("JWT_SECRET_KEY 必须配置为至少 32 个字符")
+    return SECRET_KEY
+
+
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+
+def verify_password(plain_password: str, password_hash: str) -> bool:
+    if not plain_password or not password_hash:
+        return False
+
+    # New format: pbkdf2_sha256$<rounds>$<salt_b64>$<digest_b64>
+    if password_hash.startswith("pbkdf2_sha256$"):
+        try:
+            _, rounds, salt_b64, digest_b64 = password_hash.split("$", 3)
+            salt = base64.b64decode(salt_b64.encode("ascii"))
+            expected = base64.b64decode(digest_b64.encode("ascii"))
+            calculated = hashlib.pbkdf2_hmac(
+                "sha256",
+                plain_password.encode("utf-8"),
+                salt,
+                int(rounds),
+            )
+            return hmac.compare_digest(calculated, expected)
+        except Exception:
+            return False
+
+    # Backward compatibility for legacy passlib/bcrypt hashes.
+    if password_hash.startswith("$2") or password_hash.startswith("$bcrypt"):
+        try:
+            from passlib.context import CryptContext
+
+            legacy_context = CryptContext(schemes=["bcrypt_sha256", "bcrypt"], deprecated="auto")
+            return legacy_context.verify(plain_password, password_hash)
+        except Exception:
+            return False
+
+    return False
+
+
+def get_password_hash(password: str) -> str:
+    if not password:
+        raise ValueError("password is required")
+
+    salt = os.urandom(16)
+    digest = hashlib.pbkdf2_hmac(
+        "sha256",
+        password.encode("utf-8"),
+        salt,
+        PBKDF2_ROUNDS,
+    )
+    salt_b64 = base64.b64encode(salt).decode("ascii")
+    digest_b64 = base64.b64encode(digest).decode("ascii")
+    return f"pbkdf2_sha256${PBKDF2_ROUNDS}${salt_b64}${digest_b64}"
+
+
+def create_access_token(username: str, role: str) -> str:
+    expire = datetime.now(timezone.utc) + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    payload = {
+        "sub": username,
+        "role": role,
+        "exp": expire,
+    }
+    return jwt.encode(payload, _validated_secret_key(), algorithm=ALGORITHM)
+
+
+def authenticate_user(db: Session, username: str, password: str) -> User | None:
+    user = db.query(User).filter(User.username == username).first()
+    if not user:
+        return None
+    if not verify_password(password, user.password_hash):
+        return None
+    return user
+
+
+def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)) -> User:
+    credentials_exception = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="无效或过期的认证令牌",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+    try:
+        payload = jwt.decode(token, _validated_secret_key(), algorithms=[ALGORITHM])
+        username = payload.get("sub")
+        if not username:
+            raise credentials_exception
+    except JWTError:
+        raise credentials_exception
+
+    user = db.query(User).filter(User.username == username).first()
+    if not user:
+        raise credentials_exception
+    return user
+
+
+def require_admin(current_user: User = Depends(get_current_user)) -> User:
+    if current_user.role != "admin":
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="管理员权限不足")
+    return current_user
+
+
+def ensure_bootstrap_admin() -> None:
+    """Create or promote the configured bootstrap administrator idempotently."""
+    from core.config import get_settings
+
+    settings = get_settings()
+    username = settings.admin_username.strip()
+    password = settings.admin_password
+    if not username or not password:
+        return
+
+    db = SessionLocal()
+    try:
+        user = db.query(User).filter(User.username == username).first()
+        if user is None:
+            user = User(
+                username=username,
+                password_hash=get_password_hash(password),
+                role="admin",
+            )
+            db.add(user)
+        else:
+            user.role = "admin"
+            if not verify_password(password, user.password_hash):
+                user.password_hash = get_password_hash(password)
+        db.commit()
+    finally:
+        db.close()

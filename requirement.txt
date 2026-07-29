@@ -1,0 +1,46 @@
+# CommercePilot Python dependencies
+# Supported Python versions: 3.11 - 3.13
+#
+# Install:
+#   python -m pip install -r requirement.txt
+
+# Web API
+fastapi>=0.115,<1
+uvicorn[standard]>=0.30,<1
+pydantic>=2.9,<3
+pydantic-settings>=2.5,<3
+python-dotenv>=1,<2
+python-multipart>=0.0.12,<1
+
+# Authentication and logging
+python-jose[cryptography]>=3.3,<4
+passlib[bcrypt]>=1.7,<2
+structlog>=24,<26
+tenacity>=9,<10
+
+# Databases and external storage
+sqlalchemy>=2,<3
+psycopg2-binary>=2.9,<3
+redis>=5,<8
+pymilvus>=2.4,<4
+
+# Models, agents and retrieval
+numpy>=1.26,<3
+requests>=2.32,<3
+openai>=1.50,<3
+langchain>=1,<2
+langchain-core>=1,<2
+langchain-openai>=1,<2
+langchain-community>=0.4,<1
+langchain-huggingface>=0.2,<2
+langchain-text-splitters>=0.3,<2
+sentence-transformers>=3,<6
+
+# Document parsing
+pypdf>=5,<7
+docx2txt>=0.8,<1
+unstructured[xlsx]>=0.16,<1
+openpyxl>=3.1,<4
+
+# Development
+ruff>=0.9,<1

@@ -1,0 +1,56 @@
+[build-system]
+requires = ["setuptools>=75", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "commerce-pilot"
+version = "0.1.0"
+description = "CommercePilot intelligent shopping guide and customer-service system"
+readme = "README.md"
+requires-python = ">=3.11,<3.14"
+dependencies = [
+  "fastapi>=0.115,<1",
+  "uvicorn[standard]>=0.30,<1",
+  "pydantic>=2.9,<3",
+  "pydantic-settings>=2.5,<3",
+  "python-dotenv>=1,<2",
+  "python-multipart>=0.0.12,<1",
+  "python-jose[cryptography]>=3.3,<4",
+  "passlib[bcrypt]>=1.7,<2",
+  "structlog>=24,<26",
+  "tenacity>=9,<10",
+  "sqlalchemy>=2,<3",
+  "psycopg2-binary>=2.9,<3",
+  "redis>=5,<8",
+  "pymilvus>=2.4,<4",
+  "numpy>=1.26,<3",
+  "requests>=2.32,<3",
+  "openai>=1.50,<3",
+  "langchain>=1,<2",
+  "langchain-core>=1,<2",
+  "langchain-openai>=1,<2",
+  "langchain-community>=0.4,<1",
+  "langchain-huggingface>=0.2,<2",
+  "langchain-text-splitters>=0.3,<2",
+  "sentence-transformers>=3,<6",
+  "pypdf>=5,<7",
+  "docx2txt>=0.8,<1",
+  "unstructured[xlsx]>=0.16,<1",
+  "openpyxl>=3.1,<4"
+]
+
+[project.optional-dependencies]
+dev = [
+  "ruff>=0.9,<1"
+]
+
+[tool.setuptools.packages.find]
+where = ["backend"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 88
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+ignore = ["E501"]
