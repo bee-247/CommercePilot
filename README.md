@@ -11,7 +11,7 @@
 - `backend/`：后端主目录，包含推荐 Agent、客服领域模块、RAG、数据库和接口层。
 - `backend/rag/`：RAG 能力层，负责检索、分块、入库、重写、存储和工具方法。
 - `backend/customer_service/`：客服领域能力层，包含 FAQ、导购话术、回复质检和客服路由 Agent。
-- `frontend/`：Vue 工作台，已拆分为导购、RAG、资料库、客服工具和运行状态页面。
+- `frontend/`：Vue 工作台，面向用户提供导购对话和资料库页面。
 - `data/`：知识库、索引和上传文件的本地目录。
 - `docs/`：项目文档。
 - `scripts/`：脚本与辅助工具。
@@ -25,7 +25,7 @@
 ## 当前定位
 
 仓库已经形成代码层面的融合型 MVP：销售推荐会按需读取 RAG
-证据并返回引用，五个前端页面均已接入对应 API，首次启动还可选择写入
+证据并返回引用，导购对话和资料库页面均已接入对应 API，首次启动还可选择写入
 幂等的演示商品。当前剩余工作主要是安装依赖、填写模型配置、启动外部服务并
 完成真实环境端到端联调。
 
@@ -44,6 +44,9 @@ cp .env.example .env
 docker compose up -d
 docker compose ps
 ```
+
+本地开发使用 Milvus Standalone 的内嵌 etcd 与本地持久化存储，数据保存在
+Docker 的 `milvus-data` 卷中，因此不需要额外启动 etcd 和 MinIO 容器。
 
 安装依赖：
 

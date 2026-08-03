@@ -37,9 +37,9 @@ async function submit(mode: "login" | "register") {
 <template>
   <section class="auth-card">
     <div>
-      <span class="eyebrow">RAG ACCOUNT</span>
-      <h3>登录知识工作台</h3>
-      <p class="muted">资料库、RAG 问答和客服工具需要账户授权。</p>
+      <span class="eyebrow">KNOWLEDGE ACCOUNT</span>
+      <h3>登录资料库</h3>
+      <p class="muted">资料库需要账户授权。</p>
     </div>
     <div class="auth-fields">
       <input v-model="username" autocomplete="username" placeholder="用户名" />

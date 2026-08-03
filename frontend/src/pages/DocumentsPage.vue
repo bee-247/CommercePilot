@@ -10,7 +10,6 @@ import {
 } from "../api/documents";
 import type { DocumentInfo, DocumentJob } from "../api/types";
 
-const props = defineProps<{ role?: string }>();
 const documents = ref<DocumentInfo[]>([]);
 const selectedFile = ref<File | null>(null);
 const category = ref("");
@@ -159,7 +158,7 @@ onMounted(refresh);
           <span>{{ document.chunk_count }}</span>
           <span class="status-pill">{{ document.status || "unknown" }}</span>
           <button
-            v-if="document.is_owner || props.role === 'admin'"
+            v-if="document.is_owner"
             class="danger-link"
             @click="remove(document.filename)"
           >
