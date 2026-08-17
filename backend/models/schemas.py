@@ -79,6 +79,40 @@ class ProductRecResult(AgentResult):
     recall_strategy: str = ""
 
 
+class ProductEvidence(BaseModel):
+    field: str
+    value: Any
+
+
+class CandidateEvaluation(BaseModel):
+    product_id: str
+    fit_score: float = Field(default=0.0, ge=0.0, le=100.0)
+    hard_constraints_passed: bool = True
+    matched_preferences: list[str] = Field(default_factory=list)
+    unmet_constraints: list[str] = Field(default_factory=list)
+    unverified_requirements: list[str] = Field(default_factory=list)
+    evidence: list[ProductEvidence] = Field(default_factory=list)
+    reason: str = ""
+
+
+class CandidateEvaluationResult(AgentResult):
+    agent_name: str = "candidate_evaluator"
+    evaluations: list[CandidateEvaluation] = Field(default_factory=list)
+
+
+class RecommendationIssue(BaseModel):
+    product_id: str = ""
+    issue_type: str
+    detail: str
+
+
+class RecommendationAuditResult(AgentResult):
+    agent_name: str = "recommendation_critic"
+    passed: bool = True
+    retry_recommended: bool = False
+    issues: list[RecommendationIssue] = Field(default_factory=list)
+
+
 class ShoppingGuideResult(AgentResult):
     agent_name: str = "shopping_guide"
     answer: str = ""

@@ -4,15 +4,13 @@ import json
 import re
 from typing import Any
 
+from core.config import get_settings
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_openai import ChatOpenAI
-
-from core.config import get_settings
 from models.schemas import Product, ShoppingGuideResult
 from utils.json_utils import parse_json_object
 
 from .base_agent import BaseAgent
-
 
 SYSTEM_PROMPT = """你是电商智能导购Agent。你需要基于用户需求、会话记忆、长期记忆、推荐商品和可选知识库证据，给出自然、可信、可执行的导购建议，并为每个商品生成短文案。
 
@@ -25,14 +23,22 @@ SYSTEM_PROMPT = """你是电商智能导购Agent。你需要基于用户需求�
 6. 为每个商品生成一条30字以内的卖点文案，避免“最好、第一、绝对、100%”等夸张广告词。
 7. 知识库证据只能用于解释通用原理、选购方法和注意事项，不能覆盖或虚构商品参数。
 8. 使用知识库证据时，在回答中以“资料《文件名》第X页”标明来源；没有证据时不要编造引用。
-9. 只输出JSON对象，不要解释。
+9. 优先依据候选评估中已通过硬约束、匹配分更高且证据充分的商品组织回答。
+10. 校验未通过或字段出现在 unverified_requirements 时，必须保守表达并提醒用户确认，不能将其写成确定能力。
+11. decision_summary 只给出可验证的决策摘要，不要输出内部思维过程。
+12. 只输出JSON对象，不要解释。
 
 输出格式:
 {
   "answer": "导购回答纯文本，不要使用Markdown格式，不要使用#、**、表格竖线、引用符号>",
   "product_copies": [
     {"product_id": "xxx", "copy": "商品短文案"}
-  ]
+  ],
+  "decision_summary": {
+    "requirements": ["本轮关键需求"],
+    "selection_reasons": ["有商品字段支持的选择理由"],
+    "uncertainties": ["仍需确认的信息"]
+  }
 }
 """
 
@@ -72,9 +78,23 @@ class ShoppingGuideAgent(BaseAgent):
         shopping_goals = context.get("shopping_goals", [])
 
         if not products:
+            had_evaluations = bool(context.get("candidate_evaluations"))
+            answer = (
+                "当前候选商品均未通过本轮需求约束，建议调整预算、偏好或补充关键条件后再试。"
+                if had_evaluations
+                else "我已经理解你的需求，但当前商品库或库存里没有可推荐的商品。"
+            )
             return ShoppingGuideResult(
                 success=True,
-                answer="我已经理解你的需求，但当前商品库或库存里没有可推荐的商品。",
+                answer=answer,
+                data={
+                    "displayed_product_ids": [],
+                    "decision_summary": {
+                        "requirements": [],
+                        "selection_reasons": [],
+                        "uncertainties": [answer],
+                    },
+                },
                 confidence=1.0,
             )
 
@@ -122,6 +142,7 @@ class ShoppingGuideAgent(BaseAgent):
                 )
             products = matched_products
 
+        displayed_product_ids = {product.product_id for product in products}
         payload = {
             "user_query": query,
             "image_summary": image_summary,
@@ -134,6 +155,13 @@ class ShoppingGuideAgent(BaseAgent):
                 else "natural"
             ),
             "shopping_goals": shopping_goals if isinstance(shopping_goals, list) else [],
+            "candidate_evaluations": [
+                item
+                for item in (context.get("candidate_evaluations") or [])
+                if isinstance(item, dict)
+                and str(item.get("product_id") or "") in displayed_product_ids
+            ],
+            "recommendation_audit": context.get("recommendation_audit") or {},
             "rag_evidence": [
                 {
                     "filename": item.get("filename", ""),
@@ -168,6 +196,13 @@ class ShoppingGuideAgent(BaseAgent):
         data = parse_json_object(response.content)
         answer = str(data.get("answer") or response.content)
         copies = self._clean_copies(data.get("product_copies"), products)
+        decision_summary = self._clean_decision_summary(
+            data.get("decision_summary")
+        )
+        audit = context.get("recommendation_audit") or {}
+        audit_passed = bool(
+            isinstance(audit, dict) and audit.get("passed", False)
+        )
 
         return ShoppingGuideResult(
             success=True,
@@ -177,9 +212,32 @@ class ShoppingGuideAgent(BaseAgent):
                 "product_copies": copies,
                 "displayed_product_ids": [product.product_id for product in products],
                 "requested_categories": requested_categories,
+                "decision_summary": decision_summary,
             },
-            confidence=0.9,
+            confidence=0.9 if audit_passed else 0.65,
         )
+
+    def _clean_decision_summary(self, raw: Any) -> dict[str, list[str]]:
+        if not isinstance(raw, dict):
+            return {
+                "requirements": [],
+                "selection_reasons": [],
+                "uncertainties": [],
+            }
+        return {
+            key: [
+                str(item).strip()
+                for item in raw.get(key, [])
+                if str(item).strip()
+            ]
+            if isinstance(raw.get(key), list)
+            else []
+            for key in (
+                "requirements",
+                "selection_reasons",
+                "uncertainties",
+            )
+        }
 
     def _clean_answer(self, raw: str) -> str:
         text = str(raw or "").strip()
