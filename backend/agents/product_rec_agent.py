@@ -9,9 +9,10 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal
+from services.product_constraints import hard_constraint_failures
 
-from core.config import get_settings
+from core.agent_config import get_agent_system_config
 from models.schemas import Product, ProductRecResult
 from services.recall import VectorRecallService
 
@@ -30,21 +31,131 @@ class _RecallOutcome:
     profile_count: int
 
 
+@dataclass(frozen=True)
+class RecallScenarioBid:
+    can_handle: bool
+    scenario_score: float
+    reason: str
+
+
+RecallMode = Literal["hybrid", "semantic", "profile", "popularity"]
+
+
 class ProductRecAgent(BaseAgent):
     def __init__(self):
-        settings = get_settings()
+        definition = get_agent_system_config().agent("product-recommendation")
         super().__init__(
             name="product_rec",
-            timeout=settings.agent_timeout_product_rec,
+            timeout=definition.runtime.timeout_seconds,
+            max_retries=definition.runtime.max_attempts,
         )
         self.vector_recall_service = VectorRecallService()
+
+    @staticmethod
+    def bid_recall_mode(
+        mode: RecallMode,
+        context: dict[str, Any],
+    ) -> RecallScenarioBid:
+        """Let each recall strategy assess its own fit before execution."""
+        query = str(
+            context.get("query")
+            or context.get("keyword")
+            or context.get("image_query")
+            or ""
+        ).strip()
+        has_profile = bool(
+            context.get("long_term_memory")
+            or context.get("user_profile")
+            or context.get("behavior_profile")
+        )
+        goals = context.get("shopping_goals") or []
+
+        if mode == "semantic":
+            if len(goals) > 1:
+                return RecallScenarioBid(
+                    can_handle=True,
+                    scenario_score=0.9,
+                    reason="存在多个购物目标，语义召回适合综合理解需求",
+                )
+            if len(query) > 6:
+                return RecallScenarioBid(
+                    can_handle=True,
+                    scenario_score=1.0,
+                    reason="查询描述具体，语义召回适合处理明确约束",
+                )
+            if query:
+                return RecallScenarioBid(
+                    can_handle=True,
+                    scenario_score=0.65,
+                    reason="存在简短查询，语义召回可以执行但匹配优势有限",
+                )
+            return RecallScenarioBid(
+                can_handle=True,
+                scenario_score=0.3,
+                reason="缺少明确查询，语义召回的场景匹配度较低",
+            )
+
+        if mode == "profile":
+            if has_profile:
+                return RecallScenarioBid(
+                    can_handle=True,
+                    scenario_score=1.0,
+                    reason="存在用户画像或长期记忆，适合画像召回",
+                )
+            return RecallScenarioBid(
+                can_handle=True,
+                scenario_score=0.25,
+                reason="当前请求没有可用画像信号，画像召回匹配度较低",
+            )
+
+        if mode == "popularity":
+            if not has_profile and len(query) <= 6:
+                return RecallScenarioBid(
+                    can_handle=True,
+                    scenario_score=1.0,
+                    reason="冷启动且需求宽泛，热门召回适合作为首选",
+                )
+            if not has_profile:
+                return RecallScenarioBid(
+                    can_handle=True,
+                    scenario_score=0.45,
+                    reason="缺少用户画像，但具体查询更适合语义召回",
+                )
+            return RecallScenarioBid(
+                can_handle=True,
+                scenario_score=0.3,
+                reason="已有画像信号，热门召回仅作为通用候选来源",
+            )
+
+        return RecallScenarioBid(
+            can_handle=True,
+            scenario_score=0.8,
+            reason="混合召回能够覆盖当前请求",
+        )
+
+    @classmethod
+    def select_recall_mode(cls, context: dict[str, Any]) -> tuple[RecallMode, str]:
+        """Choose a strategy inside one recall agent using the existing scenario bids."""
+        modes: tuple[RecallMode, ...] = ("semantic", "profile", "popularity")
+        bids = [(mode, cls.bid_recall_mode(mode, context)) for mode in modes]
+        eligible = [(mode, bid) for mode, bid in bids if bid.can_handle]
+        if not eligible:
+            return "hybrid", "没有适用的单路策略，使用混合召回"
+        mode, bid = max(eligible, key=lambda item: item[1].scenario_score)
+        return mode, bid.reason
 
     async def _execute(self, **kwargs: Any) -> ProductRecResult:
         user_id: str = kwargs.get("user_id", "")
         num_items: int = kwargs.get("num_items", 10)
         context: dict[str, Any] = kwargs.get("context", {})
+        recall_mode = self._recall_mode(kwargs.get("recall_mode"))
 
-        recall = await self._recall(user_id, context, num_items * 3)
+        recall = await self._recall(
+            user_id,
+            context,
+            num_items * 3,
+            mode=recall_mode,
+        )
         candidates = recall.products
         candidates = self._apply_context_filters(candidates, context)
         if not candidates:
@@ -110,8 +221,10 @@ class ProductRecAgent(BaseAgent):
         user_id: str,
         context: dict[str, Any],
         limit: int,
+        *,
+        mode: RecallMode = "hybrid",
     ) -> _RecallOutcome:
-        """Always run query embedding recall and Swing/profile recall, then merge."""
+        """Execute one broker-selectable recall strategy with safe fallbacks."""
         query = self._build_query(context)
         categories = await self._resolve_categories(
             query=query,
@@ -119,6 +232,76 @@ class ProductRecAgent(BaseAgent):
             context=context,
         )
         keywords = self._resolve_keywords(query)
+
+        if mode == "semantic":
+            query_products = await self.vector_recall_service.recall_by_query(
+                query=query,
+                profile=None,
+                categories=categories,
+                keywords=keywords,
+                limit=limit,
+            )
+            products = await self._complete_with_popularity(
+                query_products,
+                categories=categories,
+                limit=limit,
+            )
+            return _RecallOutcome(
+                products=products,
+                strategy="semantic_embedding",
+                reason="selected_semantic_recall",
+                query=query,
+                categories=categories,
+                keywords=keywords,
+                query_count=len(query_products),
+                profile_count=0,
+            )
+
+        if mode == "profile":
+            profile_products = await self.vector_recall_service.recall_by_profile(
+                user_id=user_id,
+                profile=None,
+                limit=limit,
+            )
+            if categories:
+                profile_products = self._keep_requested_categories(
+                    profile_products,
+                    categories,
+                )
+            products = await self._complete_with_popularity(
+                profile_products,
+                categories=categories,
+                limit=limit,
+            )
+            return _RecallOutcome(
+                products=products,
+                strategy="profile_swing",
+                reason="selected_profile_recall",
+                query=query,
+                categories=categories,
+                keywords=keywords,
+                query_count=0,
+                profile_count=len(profile_products),
+            )
+
+        if mode == "popularity":
+            products = (
+                await self.vector_recall_service.product_repository.recall_candidates(
+                    profile=None,
+                    categories=categories or None,
+                    limit=limit,
+                )
+            )
+            return _RecallOutcome(
+                products=products,
+                strategy="popularity",
+                reason="selected_popularity_recall",
+                query=query,
+                categories=categories,
+                keywords=keywords,
+                query_count=0,
+                profile_count=0,
+            )
 
         query_products, profile_products = await asyncio.gather(
             self.vector_recall_service.recall_by_query(
@@ -166,6 +349,29 @@ class ProductRecAgent(BaseAgent):
             query_count=len(query_products),
             profile_count=len(profile_products),
         )
+
+    def _recall_mode(self, value: Any) -> RecallMode:
+        if value in {"hybrid", "semantic", "profile", "popularity"}:
+            return value
+        return "hybrid"
+
+    async def _complete_with_popularity(
+        self,
+        products: list[Product],
+        *,
+        categories: list[str],
+        limit: int,
+    ) -> list[Product]:
+        if len(products) >= limit:
+            return products[:limit]
+        fallback_products = (
+            await self.vector_recall_service.product_repository.recall_candidates(
+                profile=None,
+                categories=categories or None,
+                limit=limit,
+            )
+        )
+        return self._append_unique(products, fallback_products, limit)
 
     def _build_query(self, context: dict[str, Any]) -> str:
         parts = [
@@ -302,7 +508,13 @@ class ProductRecAgent(BaseAgent):
         keywords = [term for term in feature_terms if term in normalized]
         for token in normalized.replace("/", " ").replace("-", " ").split():
             cleaned = token.strip("，。！？,.!?()（）")
-            if len(cleaned) >= 2 and cleaned not in keywords:
+            # 中文查询通常不含空格，整句会被切成单一 token；原句不是关键词，
+            # 直接跳过，避免下游用整句子串匹配把召回结果全部过滤掉。
+            if (
+                len(cleaned) >= 2
+                and cleaned != normalized
+                and cleaned not in keywords
+            ):
                 keywords.append(cleaned)
         return keywords[:8]
 
@@ -336,28 +548,7 @@ class ProductRecAgent(BaseAgent):
         products: list[Product],
         context: dict[str, Any],
     ) -> list[Product]:
-        budget = context.get("budget")
-        try:
-            max_price = float(budget) if budget not in ("", None) else None
-        except (TypeError, ValueError):
-            max_price = None
-
-        filtered = products
-        if max_price and max_price > 0:
-            filtered = [
-                product for product in filtered if product.price <= max_price
-            ]
-
-        avoid_categories = context.get("avoid_categories") or []
-        if isinstance(avoid_categories, list) and avoid_categories:
-            avoid = {str(category) for category in avoid_categories if category}
-            filtered = [
-                product
-                for product in filtered
-                if product.category not in avoid
-            ]
-
-        return filtered
+        return [product for product in products if not hard_constraint_failures(product, context)]
 
     def _rank(
         self,

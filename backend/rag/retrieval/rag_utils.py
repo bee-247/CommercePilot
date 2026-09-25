@@ -1,13 +1,13 @@
 from collections import defaultdict
 from typing import List, Tuple, Dict, Any
 import os
-import json
-import requests
 
 from ..storage.milvus_client import MilvusManager
 from .embedding import embedding_service as _embedding_service
 from ..storage.parent_chunk_store import ParentChunkStore
-from langchain.chat_models import init_chat_model
+from core.config import get_settings
+from core.model_clients import create_chat_model, rerank_endpoint
+from services.reranking import get_reranking_service
 from ..storage.database import SessionLocal
 from customer_service.tool_context import get_service_username
 from ..storage.models import Resource, User
@@ -16,12 +16,8 @@ from core.env import load_project_env
 
 load_project_env()
 
-ARK_API_KEY = os.getenv("ARK_API_KEY")
-MODEL = os.getenv("MODEL")
-BASE_URL = os.getenv("BASE_URL")
-RERANK_MODEL = os.getenv("RERANK_MODEL")
-RERANK_BINDING_HOST = os.getenv("RERANK_BINDING_HOST")
-RERANK_API_KEY = os.getenv("RERANK_API_KEY")
+_settings = get_settings()
+RERANK_MODEL = _settings.rerank_model
 AUTO_MERGE_ENABLED = os.getenv("AUTO_MERGE_ENABLED", "true").lower() != "false"
 AUTO_MERGE_THRESHOLD = int(os.getenv("AUTO_MERGE_THRESHOLD", "2"))
 LEAF_RETRIEVE_LEVEL = int(os.getenv("LEAF_RETRIEVE_LEVEL", "3"))
@@ -34,10 +30,7 @@ _stepback_model = None
 
 
 def _get_rerank_endpoint() -> str:
-    if not RERANK_BINDING_HOST:
-        return ""
-    host = RERANK_BINDING_HOST.strip().rstrip("/")
-    return host if host.endswith("/v1/rerank") else f"{host}/v1/rerank"
+    return "local" if _settings.rerank_model_path else rerank_endpoint()
 
 
 def _merge_to_parent_level(docs: List[dict], threshold: int = 2) -> Tuple[List[dict], int]:
@@ -65,6 +58,13 @@ def _merge_to_parent_level(docs: List[dict], threshold: int = 2) -> Tuple[List[d
         score = doc.get("score")
         if score is not None:
             parent_doc["score"] = max(float(parent_doc.get("score", score)), float(score))
+        rerank_scores = [
+            float(child["rerank_score"])
+            for child in groups[parent_id]
+            if child.get("rerank_score") is not None
+        ]
+        if rerank_scores:
+            parent_doc["rerank_score"] = max(rerank_scores)
         parent_doc["merged_from_children"] = True
         parent_doc["merged_child_count"] = len(groups[parent_id])
         merged_docs.append(parent_doc)
@@ -96,7 +96,10 @@ def _auto_merge_documents(docs: List[dict], top_k: int) -> Tuple[List[dict], Dic
     merged_docs, merged_count_l3_l2 = _merge_to_parent_level(docs, threshold=AUTO_MERGE_THRESHOLD)
     merged_docs, merged_count_l2_l1 = _merge_to_parent_level(merged_docs, threshold=AUTO_MERGE_THRESHOLD)
 
-    merged_docs.sort(key=lambda item: item.get("score", 0.0), reverse=True)
+    merged_docs.sort(
+        key=lambda item: item.get("rerank_score", item.get("score", 0.0)),
+        reverse=True,
+    )
     merged_docs = merged_docs[:top_k]
 
     replaced_count = merged_count_l3_l2 + merged_count_l2_l1
@@ -110,73 +113,15 @@ def _auto_merge_documents(docs: List[dict], top_k: int) -> Tuple[List[dict], Dic
 
 
 def _rerank_documents(query: str, docs: List[dict], top_k: int) -> Tuple[List[dict], Dict[str, Any]]:
-    docs_with_rank = [{**doc, "rrf_rank": i} for i, doc in enumerate(docs, 1)]
-    meta: Dict[str, Any] = {
-        "rerank_enabled": bool(RERANK_MODEL and RERANK_API_KEY and RERANK_BINDING_HOST),
-        "rerank_applied": False,
-        "rerank_model": RERANK_MODEL,
-        "rerank_endpoint": _get_rerank_endpoint(),
-        "rerank_error": None,
-        "candidate_count": len(docs_with_rank),
-    }
-    if not docs_with_rank or not meta["rerank_enabled"]:
-        return docs_with_rank[:top_k], meta
-
-    payload = {
-        "model": RERANK_MODEL,
-        "query": query,
-        "documents": [doc.get("text", "") for doc in docs_with_rank],
-        "top_n": min(top_k, len(docs_with_rank)),
-        "return_documents": False,
-    }
-
-    headers = {
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {RERANK_API_KEY}",
-    }
-    try:
-        meta["rerank_applied"] = True
-        response = requests.post(
-            meta["rerank_endpoint"],
-            headers=headers,
-            json=payload,
-            timeout=15,
-        )
-        if response.status_code >= 400:
-            meta["rerank_error"] = f"HTTP {response.status_code}: {response.text}"
-            return docs_with_rank[:top_k], meta
-
-        items = response.json().get("results", [])
-        reranked = []
-        for item in items:
-            idx = item.get("index")
-            if isinstance(idx, int) and 0 <= idx < len(docs_with_rank):
-                doc = dict(docs_with_rank[idx])
-                score = item.get("relevance_score")
-                if score is not None:
-                    doc["rerank_score"] = score
-                reranked.append(doc)
-
-        if reranked:
-            return reranked[:top_k], meta
-
-        meta["rerank_error"] = "empty_rerank_results"
-        return docs_with_rank[:top_k], meta
-    except (requests.RequestException, json.JSONDecodeError, KeyError, ValueError, TypeError) as e:
-        meta["rerank_error"] = str(e)
-        return docs_with_rank[:top_k], meta
+    return get_reranking_service().rerank(query, docs, top_k)
 
 
 def _get_stepback_model():
     global _stepback_model
-    if not ARK_API_KEY or not MODEL:
+    if not _settings.text_api_key or not _settings.text_llm:
         return None
     if _stepback_model is None:
-        _stepback_model = init_chat_model(
-            model=MODEL,
-            model_provider="openai",
-            api_key=ARK_API_KEY,
-            base_url=BASE_URL,
+        _stepback_model = create_chat_model(
             temperature=0.2,
         )
     return _stepback_model
@@ -367,7 +312,7 @@ def retrieve_documents(
             return {
                 "docs": [],
                 "meta": {
-                    "rerank_enabled": bool(RERANK_MODEL and RERANK_API_KEY and RERANK_BINDING_HOST),
+                    "rerank_enabled": get_reranking_service().enabled,
                     "rerank_applied": False,
                     "rerank_model": RERANK_MODEL,
                     "rerank_endpoint": _get_rerank_endpoint(),
@@ -383,3 +328,74 @@ def retrieve_documents(
                     "candidate_count": 0,
                 },
             }
+
+
+def retrieve_documents_fast(
+    query: str,
+    top_k: int = 5,
+    *,
+    category: str = "",
+    brand: str = "",
+    business_line: str = "",
+    document_type: str = "",
+    section_title: str = "",
+    username: str = "",
+) -> Dict[str, Any]:
+    """Run bounded hybrid retrieval without external rerank or parent merging."""
+    result_limit = max(1, top_k)
+    filter_expr = _build_retrieval_filter(
+        category=category,
+        brand=brand,
+        business_line=business_line,
+        document_type=document_type,
+        section_title=section_title,
+        username=username or get_service_username(),
+    )
+    try:
+        dense_embedding = _embedding_service.get_embeddings([query])[0]
+        sparse_embedding = _embedding_service.get_sparse_embedding(query)
+        documents = _milvus_manager.hybrid_retrieve(
+            dense_embedding=dense_embedding,
+            sparse_embedding=sparse_embedding,
+            top_k=result_limit,
+            filter_expr=filter_expr,
+        )
+        mode = "hybrid_fast"
+    except Exception:
+        try:
+            dense_embedding = _embedding_service.get_embeddings([query])[0]
+            documents = _milvus_manager.dense_retrieve(
+                dense_embedding=dense_embedding,
+                top_k=result_limit,
+                filter_expr=filter_expr,
+            )
+            mode = "dense_fast_fallback"
+        except Exception:
+            documents = []
+            mode = "failed"
+
+    ranked_documents = [
+        {**document, "rrf_rank": index}
+        for index, document in enumerate(documents[:result_limit], 1)
+    ]
+    return {
+        "docs": ranked_documents,
+        "meta": {
+            "retrieval_mode": mode,
+            "retrieval_profile": "fast",
+            "candidate_k": result_limit,
+            "candidate_count": len(ranked_documents),
+            "leaf_retrieve_level": LEAF_RETRIEVE_LEVEL,
+            "filter_expr": filter_expr,
+            "rerank_enabled": False,
+            "rerank_applied": False,
+            "rerank_model": None,
+            "rerank_endpoint": "",
+            "rerank_error": "retrieve_failed" if mode == "failed" else None,
+            "auto_merge_enabled": False,
+            "auto_merge_applied": False,
+            "auto_merge_threshold": None,
+            "auto_merge_replaced_chunks": 0,
+            "auto_merge_steps": 0,
+        },
+    }

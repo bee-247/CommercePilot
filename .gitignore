@@ -23,5 +23,6 @@ frontend/dist/
 logs/*
 !logs/.gitkeep
 
-/data/
+/data/*
+!/data/*.py
 /model/

@@ -96,25 +96,25 @@ class CandidateEvaluation(BaseModel):
 
 
 class CandidateEvaluationResult(AgentResult):
-    agent_name: str = "candidate_evaluator"
+    agent_name: str = "candidate_evaluation_step"
     evaluations: list[CandidateEvaluation] = Field(default_factory=list)
 
 
-class RecommendationIssue(BaseModel):
+class QualityIssue(BaseModel):
     product_id: str = ""
     issue_type: str
     detail: str
 
 
-class RecommendationAuditResult(AgentResult):
-    agent_name: str = "recommendation_critic"
+class QualityReviewResult(AgentResult):
+    agent_name: str = "quality_reviewer"
     passed: bool = True
     retry_recommended: bool = False
-    issues: list[RecommendationIssue] = Field(default_factory=list)
+    issues: list[QualityIssue] = Field(default_factory=list)
 
 
 class ShoppingGuideResult(AgentResult):
-    agent_name: str = "shopping_guide"
+    agent_name: str = "response_generation"
     answer: str = ""
     copies: list[dict[str, str]] = Field(default_factory=list)
 
@@ -128,6 +128,8 @@ class RecommendationResponse(BaseModel):
     agent_results: dict[str, AgentResult] = Field(default_factory=dict)
     rag_trace: dict[str, Any] = Field(default_factory=dict)
     citations: list[dict[str, Any]] = Field(default_factory=list)
+    orchestration_mode: str = "workflow"
+    orchestration_trace: dict[str, Any] = Field(default_factory=dict)
     total_latency_ms: float = 0.0
     timestamp: datetime = Field(default_factory=datetime.now)
 
@@ -140,3 +142,4 @@ class ChatResponse(BaseModel):
     token_usage: dict[str, int] = Field(default_factory=dict)
     rag_trace: dict[str, Any] = Field(default_factory=dict)
     citations: list[dict[str, Any]] = Field(default_factory=list)
+    request_latency_ms: float = 0.0

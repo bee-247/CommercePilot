@@ -2,24 +2,29 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
+import time
 import uuid
+from collections.abc import AsyncIterator
+from contextlib import suppress
 from typing import Any
 
 import structlog
-from fastapi import APIRouter, File, Form, HTTPException, UploadFile
-
 from core.application_state import (
-    chat_router_agent,
-    conversation_context_agent,
     conversation_memory,
-    conversation_reply_agent,
+    conversation_understanding_agent,
     image_understanding_agent,
     metrics_collector,
     product_repository,
-    supervisor,
+    recommendation_orchestrator,
+    response_generation_agent,
+    quality_reviewer_agent,
 )
+from core.config import get_settings
+from fastapi import APIRouter, File, Form, HTTPException, UploadFile
+from fastapi.responses import StreamingResponse
 from models.schemas import (
     AgentResult,
     ChatHistoryMessage,
@@ -29,9 +34,12 @@ from models.schemas import (
     RecommendationRequest,
     RecommendationResponse,
 )
+from services.execution_progress import (
+    report_progress,
+    reset_progress_reporter,
+    set_progress_reporter,
+)
 from services.token_counter import build_token_usage
-from core.config import get_settings
-
 
 logger = structlog.get_logger()
 router = APIRouter(prefix="/api/v1", tags=["sales-chat"])
@@ -39,8 +47,8 @@ router = APIRouter(prefix="/api/v1", tags=["sales-chat"])
 
 @router.post("/recommend", response_model=RecommendationResponse)
 async def recommend(request: RecommendationRequest):
-    """使用Supervisor编排器进行推荐 (生产推荐用法)"""
-    response = await supervisor.recommend(request)
+    """Run recommendation through the configured workflow or Agent Mesh."""
+    response = await recommendation_orchestrator.recommend(request)
     _collect_metrics(response)
     return response
 
@@ -48,33 +56,61 @@ async def recommend(request: RecommendationRequest):
 @router.post("/chat", response_model=ChatResponse)
 async def chat(request: ChatRequest):
     """Web chat entry: route conversational turns before recommending products."""
+    return await _run_chat(request)
+
+
+@router.post("/chat/stream")
+async def chat_stream(request: ChatRequest):
+    """Stream live Agent progress followed by the complete chat response."""
+    return StreamingResponse(
+        _stream_chat_response(request),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache, no-store, must-revalidate",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+async def _run_chat(request: ChatRequest) -> ChatResponse:
+    request_started = time.perf_counter()
     memory = conversation_memory.get(request.user_id, request.session_id)
     history = conversation_memory.history_for_agent(memory)
-    route_result = await chat_router_agent.run(
-        message=request.message,
-        history=history,
-    )
-    route_data = route_result.data
-    if not route_data.get("needs_recommendation", True):
-        return await _chat_without_recommendation(
-            request=request,
-            memory=memory,
-            history=history,
-            route_result=route_result,
-        )
-
-    available_categories = await product_repository.list_active_categories()
-    context_result = await conversation_context_agent.run(
+    try:
+        available_categories = await product_repository.list_active_categories()
+    except Exception as exc:
+        logger.warning("conversation_understanding.categories_unavailable", error=str(exc))
+        available_categories = []
+    await report_progress("conversation_understanding", "识别意图并整理购物需求", "running")
+    understanding_result = await conversation_understanding_agent.run(
         message=request.message,
         history=history,
         available_categories=available_categories,
     )
-    rewritten = context_result.data
+    await report_progress(
+        "conversation_understanding",
+        "识别意图并整理购物需求",
+        "completed" if understanding_result.success else "failed",
+        latency_ms=round(understanding_result.latency_ms, 1),
+        agent_id=understanding_result.agent_name,
+        error=understanding_result.error,
+    )
+    if not understanding_result.data.get("needs_recommendation", True):
+        return await _chat_without_recommendation(
+            request=request,
+            memory=memory,
+            history=history,
+            understanding_result=understanding_result,
+            request_started=request_started,
+        )
+
+    rewritten = understanding_result.data
     query = rewritten.get("standalone_query") or request.message
     categories = rewritten.get("categories") or []
     logger.info(
-        "conversation_context.resolved",
-        success=context_result.success,
+        "conversation_understanding.resolved",
+        success=understanding_result.success,
         categories=categories,
         shopping_goal_count=len(rewritten.get("shopping_goals") or []),
     )
@@ -113,12 +149,20 @@ async def chat(request: ChatRequest):
         num_items=request.num_items,
         context=context,
     )
-    response = await supervisor.recommend(rec_request)
-    response.agent_results["chat_router"] = route_result
-    response.agent_results["conversation_context"] = context_result
+    await report_progress("recommendation", "规划并执行推荐流程", "running")
+    response = await recommendation_orchestrator.recommend(rec_request)
+    await report_progress(
+        "recommendation",
+        "规划并执行推荐流程",
+        "completed",
+        latency_ms=round(response.total_latency_ms, 1),
+        agent_id=response.orchestration_mode,
+    )
+    response.agent_results["conversation_understanding"] = understanding_result
     _collect_metrics(response)
     product_result = response.agent_results.get("product_rec")
     answer = _build_chat_answer(request.message, response)
+    await report_progress("memory", "保存本轮会话记忆", "running")
     await conversation_memory.update(
         memory=memory,
         user_message=request.message,
@@ -126,12 +170,13 @@ async def chat(request: ChatRequest):
         context=context,
         response=response,
     )
-    if route_result.data.get("needs_memory_update"):
+    if understanding_result.data.get("needs_memory_update"):
         saved_memories = await conversation_memory.update_long_term_from_message(
             memory=memory,
             user_message=request.message,
         )
-        route_result.data["updated_memories"] = saved_memories
+        understanding_result.data["updated_memories"] = saved_memories
+    await report_progress("memory", "保存本轮会话记忆", "completed")
     token_usage = build_token_usage(
         request_payload={
             "message": request.message,
@@ -159,6 +204,10 @@ async def chat(request: ChatRequest):
         token_usage=token_usage,
         rag_trace=response.rag_trace,
         citations=response.citations,
+        request_latency_ms=round(
+            (time.perf_counter() - request_started) * 1000,
+            1,
+        ),
     )
 
 
@@ -166,7 +215,8 @@ async def _chat_without_recommendation(
     request: ChatRequest,
     memory: Any,
     history: list[ChatHistoryMessage],
-    route_result: AgentResult,
+    understanding_result: AgentResult,
+    request_started: float,
 ) -> ChatResponse:
     context: dict[str, Any] = {
         "query": request.message,
@@ -176,25 +226,60 @@ async def _chat_without_recommendation(
             _history_item_to_dict(item) for item in history[-8:]
         ],
         "session_memory": memory.to_context(),
-        "chat_route": route_result.data,
+        "chat_route": understanding_result.data,
     }
-    reply_result = await conversation_reply_agent.run(
+    product_ids = list(dict.fromkeys(
+        str(product_id)
+        for turn in context["session_memory"].get("recent_turns", [])
+        for product_id in turn.get("recommended_product_ids", [])
+    ))
+    try:
+        product_facts = await product_repository.get_products_by_ids(product_ids)
+    except Exception as exc:
+        logger.warning("conversation.product_facts_unavailable", error=str(exc))
+        product_facts = []
+    context["product_facts"] = [product.model_dump() for product in product_facts]
+    await report_progress("response_generation", "生成对话回复", "running")
+    reply_result = await response_generation_agent.run(
+        mode="conversation",
         message=request.message,
         history=history,
         context=context,
     )
-    answer = str(reply_result.data.get("answer") or "").strip()
-    if not answer:
-        answer = "好的，我明白了。"
-
-    response = _empty_recommendation_response(
-        user_id=request.user_id,
-        agent_results={
-            "chat_router": route_result,
-            "conversation_reply": reply_result,
-        },
+    await report_progress(
+        "response_generation",
+        "生成对话回复",
+        "completed" if reply_result.success else "failed",
+        latency_ms=round(reply_result.latency_ms, 1),
+        agent_id=reply_result.agent_name,
     )
+    agent_results = {"conversation_understanding": understanding_result}
+    if not reply_result.data.get("deterministic_reply"):
+        await report_progress("quality_review", "审核最终回复", "running")
+        review_args = {
+            "mode": "conversation", "context": context,
+            "products": product_facts,
+        }
+        audit = await quality_reviewer_agent.run(draft=reply_result.data.get("answer", ""), **review_args)
+        if audit.success and not audit.passed and audit.retry_recommended:
+            reply_result = await response_generation_agent.run(
+                mode="conversation", message=request.message, history=history, context=context,
+                feedback=[issue.model_dump() for issue in audit.issues],
+            )
+            audit = await quality_reviewer_agent.run(draft=reply_result.data.get("answer", ""), **review_args)
+        if not audit.success or not audit.passed:
+            reply_result = AgentResult(
+                agent_name="response_generation", success=True,
+                data={"answer": "当前资料不足以确认这些信息，请补充商品或需求细节。", "review_blocked": True},
+                confidence=0.0,
+            )
+        agent_results["quality_reviewer"] = audit
+        await report_progress("quality_review", "审核最终回复", "completed" if audit.passed else "failed", agent_id=audit.agent_name)
+    answer = str(reply_result.data.get("answer") or "好的，我明白了。").strip()
+    agent_results["response_generation"] = reply_result
+    response = _empty_recommendation_response(user_id=request.user_id, agent_results=agent_results)
     _collect_metrics(response)
+    await report_progress("memory", "保存本轮会话记忆", "running")
     await conversation_memory.update(
         memory=memory,
         user_message=request.message,
@@ -202,12 +287,13 @@ async def _chat_without_recommendation(
         context=context,
         response=response,
     )
-    if route_result.data.get("needs_memory_update"):
+    if understanding_result.data.get("needs_memory_update"):
         saved_memories = await conversation_memory.update_long_term_from_message(
             memory=memory,
             user_message=request.message,
         )
         reply_result.data["updated_memories"] = saved_memories
+    await report_progress("memory", "保存本轮会话记忆", "completed")
     token_usage = build_token_usage(
         request_payload={
             "message": request.message,
@@ -226,12 +312,93 @@ async def _chat_without_recommendation(
     return ChatResponse(
         answer=answer,
         recall_strategy="skipped",
-        recall_reason=str(route_result.data.get("reason") or "no_recommendation_needed"),
+        recall_reason=str(understanding_result.data.get("reason") or "no_recommendation_needed"),
         recommendation=response,
         token_usage=token_usage,
         rag_trace=response.rag_trace,
         citations=response.citations,
+        request_latency_ms=round(
+            (time.perf_counter() - request_started) * 1000,
+            1,
+        ),
     )
+
+
+async def _stream_chat_response(request: ChatRequest) -> AsyncIterator[str]:
+    queue: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue()
+    stream_started = time.perf_counter()
+
+    async def emit(event: dict[str, Any]) -> None:
+        event["elapsed_ms"] = round(
+            (time.perf_counter() - stream_started) * 1000,
+            1,
+        )
+        await queue.put(event)
+
+    async def produce() -> None:
+        progress_token = set_progress_reporter(emit)
+        try:
+            result = await _run_chat(request)
+            await queue.put(
+                {
+                    "type": "result",
+                    "data": result.model_dump(mode="json"),
+                }
+            )
+        except Exception as exc:
+            logger.exception("sales_chat.stream_failed", error=str(exc))
+            await queue.put({"type": "error", "content": str(exc)})
+        finally:
+            reset_progress_reporter(progress_token)
+            await queue.put(None)
+
+    producer = asyncio.create_task(produce())
+    try:
+        while True:
+            event = await queue.get()
+            if event is None:
+                break
+            yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+    finally:
+        if not producer.done():
+            producer.cancel()
+            with suppress(asyncio.CancelledError):
+                await producer
+
+
+@router.get("/chat/sessions")
+async def list_chat_sessions(user_id: str = "web_user"):
+    return {
+        "sessions": conversation_memory.list_sessions(user_id=user_id),
+    }
+
+
+@router.get("/chat/sessions/{session_id}")
+async def get_chat_session_messages(
+    session_id: str,
+    user_id: str = "web_user",
+):
+    return {
+        "session_id": session_id,
+        "messages": conversation_memory.session_messages(
+            user_id=user_id,
+            session_id=session_id,
+        ),
+    }
+
+
+@router.delete("/chat/sessions/{session_id}")
+async def delete_chat_session(
+    session_id: str,
+    user_id: str = "web_user",
+):
+    return {
+        "session_id": session_id,
+        "deleted": conversation_memory.delete_session(
+            user_id=user_id,
+            session_id=session_id,
+        ),
+    }
 
 
 @router.post("/chat/image", response_model=ChatResponse)
@@ -243,6 +410,7 @@ async def chat_with_image(
     image: UploadFile = File(...),
 ):
     """Multimodal chat entry: understand an uploaded image before recommendation."""
+    request_started = time.perf_counter()
     content_type = image.content_type or ""
     if not content_type.startswith("image/"):
         raise HTTPException(status_code=400, detail="仅支持图片文件")
@@ -270,18 +438,19 @@ async def chat_with_image(
     category = image_result.data.get("category") or None
     memory = conversation_memory.get(user_id, session_id)
     memory_history = conversation_memory.history_for_agent(memory)
-    context_result = await conversation_context_agent.run(
+    understanding_result = await conversation_understanding_agent.run(
         message=message or query,
         history=memory_history,
         available_categories=available_categories,
         image_summary=image_result.data.get("summary", ""),
+        force_recommendation=True,
     )
-    rewritten = context_result.data
+    rewritten = understanding_result.data
     rewritten_query = rewritten.get("standalone_query") or query
     categories = rewritten.get("categories") or []
     logger.info(
-        "conversation_context.resolved",
-        success=context_result.success,
+        "conversation_understanding.resolved",
+        success=understanding_result.success,
         categories=categories,
         shopping_goal_count=len(rewritten.get("shopping_goals") or []),
     )
@@ -323,9 +492,9 @@ async def chat_with_image(
         num_items=6,
         context=context,
     )
-    response = await supervisor.recommend(rec_request)
+    response = await recommendation_orchestrator.recommend(rec_request)
     response.agent_results["image_understanding"] = image_result
-    response.agent_results["conversation_context"] = context_result
+    response.agent_results["conversation_understanding"] = understanding_result
     _collect_metrics(response)
 
     product_result = response.agent_results.get("product_rec")
@@ -366,6 +535,10 @@ async def chat_with_image(
         token_usage=token_usage,
         rag_trace=response.rag_trace,
         citations=response.citations,
+        request_latency_ms=round(
+            (time.perf_counter() - request_started) * 1000,
+            1,
+        ),
     )
 
 
@@ -474,7 +647,7 @@ def _compression_payload(memory: Any) -> dict[str, Any]:
 
 def _build_chat_answer(message: str, response: RecommendationResponse) -> str:
     count = len(response.products)
-    guide_result = response.agent_results.get("shopping_guide")
+    guide_result = response.agent_results.get("response_generation")
     if guide_result and guide_result.success and guide_result.data is not None:
         answer = getattr(guide_result, "answer", "")
         if answer:
@@ -498,11 +671,11 @@ def _build_image_chat_answer(
 ) -> str:
     count = len(response.products)
     summary = image_data.get("summary") or "图片内容"
-    guide_result = response.agent_results.get("shopping_guide")
+    guide_result = response.agent_results.get("response_generation")
     if guide_result and guide_result.success:
         answer = getattr(guide_result, "answer", "")
         if answer:
-            return _append_product_lines(f"我看到了{summary}。\n{answer}", response)
+            return _append_product_lines(answer, response)
 
     if count == 0:
         return (
@@ -555,7 +728,7 @@ def _append_product_lines(answer: str, response: RecommendationResponse) -> str:
 
 
 def _products_used_by_guide(response: RecommendationResponse) -> list[Product]:
-    guide_result = response.agent_results.get("shopping_guide")
+    guide_result = response.agent_results.get("response_generation")
     if guide_result and guide_result.data is not None:
         displayed_ids = guide_result.data.get("displayed_product_ids")
         if isinstance(displayed_ids, list):

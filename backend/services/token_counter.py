@@ -35,17 +35,22 @@ def build_token_usage(
     summary_tokens = estimate_tokens(summary)
     recent_messages_tokens = estimate_tokens(recent_messages)
     pending_turn_tokens = estimate_tokens(pending_turns)
+    memory_tokens = (
+        compression_payload_tokens
+        + session_memory_tokens
+        + summary_tokens
+        + recent_messages_tokens
+        + pending_turn_tokens
+    )
     return {
-        "total_tokens": (
-            input_tokens
-            + output_tokens
-            + agent_trace_tokens
-            + compression_payload_tokens
-            + session_memory_tokens
-            + summary_tokens
-            + recent_messages_tokens
-            + pending_turn_tokens
-        ),
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "agent_trace_tokens": agent_trace_tokens,
+        "memory_tokens": memory_tokens,
+        "total_tokens": input_tokens
+        + output_tokens
+        + agent_trace_tokens
+        + memory_tokens,
     }
 
 

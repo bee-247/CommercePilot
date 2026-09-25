@@ -2,15 +2,13 @@ from __future__ import annotations
 
 from typing import Any
 
+from core.agent_config import get_agent_system_config
 from langchain_core.messages import HumanMessage, SystemMessage
-from langchain_openai import ChatOpenAI
-
-from core.config import get_settings
+from core.model_clients import create_chat_model
 from models.schemas import AgentResult
 from utils.json_utils import parse_json_object
 
 from .base_agent import BaseAgent
-
 
 SYSTEM_PROMPT = """你是电商图片理解Agent。根据用户上传的图片、用户文字需求和当前商品库可用类目，提取适合商品推荐召回的信息。
 
@@ -31,14 +29,18 @@ SYSTEM_PROMPT = """你是电商图片理解Agent。根据用户上传的图片�
 
 class ImageUnderstandingAgent(BaseAgent):
     def __init__(self):
-        settings = get_settings()
-        super().__init__(name="image_understanding", timeout=10.0)
-        self.llm = ChatOpenAI(
-            api_key=settings.llm_api_key,
-            base_url=settings.llm_base_url,
-            model=settings.llm_model,
-            temperature=0.2,
-            max_tokens=800,
+        agent_config = get_agent_system_config()
+        definition = agent_config.agent("image-understanding")
+        model_config = agent_config.resolved_model("image-understanding")
+        super().__init__(
+            name="image_understanding",
+            timeout=definition.runtime.timeout_seconds,
+            max_retries=definition.runtime.max_attempts,
+        )
+        self.llm = create_chat_model(
+            role="vision",
+            temperature=model_config.temperature,
+            max_tokens=model_config.max_tokens,
         )
 
     async def _execute(self, **kwargs: Any) -> AgentResult:

@@ -68,7 +68,6 @@ async function runTool() {
 <template>
   <section class="workspace-grid">
     <article class="panel">
-      <span class="eyebrow">COMMERCEPILOT CUSTOMER SERVICE</span>
       <h2>客服内容工具</h2>
       <div class="button-row service-modes">
         <button
@@ -103,7 +102,7 @@ async function runTool() {
         <label>补充政策背景<textarea v-model="policyContext" rows="3" placeholder="可选" /></label>
       </div>
 
-      <p v-if="error" class="error-text">{{ error }}</p>
+      <p v-if="error" class="error-text" role="alert">{{ error }}</p>
       <button class="primary action-button" :disabled="loading" @click="runTool">
         {{ loading ? "处理中…" : "开始生成" }}
       </button>
@@ -112,7 +111,6 @@ async function runTool() {
     <article class="panel">
       <div class="section-heading">
         <div>
-          <span class="eyebrow">VERIFIED OUTPUT</span>
           <h2>{{ result?.title || "客服结果" }}</h2>
         </div>
         <span v-if="result?.agent_route" class="status-pill">

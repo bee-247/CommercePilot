@@ -7,7 +7,7 @@ from datetime import datetime, timedelta
 from typing import Any
 
 from langchain_core.messages import HumanMessage, SystemMessage
-from langchain_openai import ChatOpenAI
+from core.model_clients import create_chat_model
 
 from core.config import get_settings
 from agents.memory_update_agent import MemoryUpdateAgent
@@ -111,10 +111,7 @@ class ConversationMemoryStore:
             if max_memory_tokens is not None
             else settings.session_memory_max_tokens
         )
-        self.llm = ChatOpenAI(
-            api_key=settings.llm_api_key,
-            base_url=settings.llm_base_url,
-            model=settings.llm_model,
+        self.llm = create_chat_model(
             temperature=0.0,
             max_tokens=900,
         )
@@ -152,6 +149,76 @@ class ConversationMemoryStore:
             for item in memory.messages[-8:]
             if item.get("role") and item.get("content")
         ]
+
+    def list_sessions(
+        self,
+        user_id: str,
+        limit: int = 30,
+    ) -> list[dict[str, Any]]:
+        clean_user_id = user_id or "web_user"
+        with UserSessionLocal() as session:
+            records = (
+                session.query(ConversationSessionRecord)
+                .filter(ConversationSessionRecord.user_id == clean_user_id)
+                .order_by(ConversationSessionRecord.updated_at.desc())
+                .limit(max(1, min(limit, 100)))
+                .all()
+            )
+        sessions = []
+        for record in records:
+            messages = self._dict_list(self._loads(record.messages_json, []))
+            if not messages:
+                continue
+            preview = next(
+                (
+                    str(item.get("content") or "")
+                    for item in reversed(messages)
+                    if item.get("role") == "user"
+                ),
+                "新对话",
+            )
+            sessions.append(
+                {
+                    "session_id": record.session_id,
+                    "updated_at": record.updated_at.isoformat()
+                    if record.updated_at
+                    else "",
+                    "message_count": len(messages),
+                    "preview": preview[:60],
+                }
+            )
+        return sessions
+
+    def session_messages(
+        self,
+        user_id: str,
+        session_id: str,
+    ) -> list[dict[str, str]]:
+        key = self.session_key(user_id, session_id)
+        with UserSessionLocal() as session:
+            record = session.get(ConversationSessionRecord, key)
+            if record is None or record.user_id != (user_id or "web_user"):
+                return []
+            messages = self._dict_list(self._loads(record.messages_json, []))
+        return [
+            {
+                "role": str(item.get("role") or ""),
+                "content": str(item.get("content") or ""),
+            }
+            for item in messages
+            if item.get("role") in {"user", "assistant"} and item.get("content")
+        ]
+
+    def delete_session(self, user_id: str, session_id: str) -> bool:
+        clean_user_id = user_id or "web_user"
+        key = self.session_key(clean_user_id, session_id)
+        with UserSessionLocal() as session:
+            record = session.get(ConversationSessionRecord, key)
+            if record is None or record.user_id != clean_user_id:
+                return False
+            session.delete(record)
+            session.commit()
+        return True
 
     async def update(
         self,
@@ -810,12 +877,12 @@ class ConversationMemoryStore:
                 event["profile_recall_count"] = data.get("profile_recall_count", 0)
                 event["selected_categories"] = data.get("selected_categories", [])
                 event["selected_keywords"] = data.get("selected_keywords", [])
-            elif name == "conversation_context":
+            elif name in {"conversation_understanding", "conversation_context"}:
                 event["standalone_query"] = data.get("standalone_query", "")
                 event["is_follow_up"] = data.get("is_follow_up", False)
                 event["constraints"] = data.get("constraints", [])
-            elif name == "shopping_guide":
-                event["answer"] = getattr(result, "answer", "")[:500]
+            elif name in {"response_generation", "shopping_guide"}:
+                event["answer"] = (getattr(result, "answer", "") or data.get("answer", ""))[:500]
             events.append(event)
         return events
 

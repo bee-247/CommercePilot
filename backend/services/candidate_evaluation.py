@@ -1,20 +1,22 @@
 from __future__ import annotations
 
+import asyncio
 import json
+import time
 from typing import Any
 
-from core.config import get_settings
+from core.agent_config import get_agent_system_config
+from core.model_clients import create_chat_model
 from langchain_core.messages import HumanMessage, SystemMessage
-from langchain_openai import ChatOpenAI
 from models.schemas import (
     CandidateEvaluation,
     CandidateEvaluationResult,
     Product,
     ProductEvidence,
 )
+from services.candidate_rules import RuleCandidateEvaluator
+from services.product_constraints import hard_constraint_failures
 from utils.json_utils import parse_json_object
-
-from .base_agent import BaseAgent
 
 SYSTEM_PROMPT = """你是电商候选商品评估Agent。请根据结构化购物需求和商品事实，逐个评估候选商品。
 
@@ -56,26 +58,61 @@ _EVIDENCE_FIELDS = {
 }
 
 
-class CandidateEvaluatorAgent(BaseAgent):
+class CandidateEvaluationService:
     def __init__(self):
-        settings = get_settings()
-        super().__init__(
-            name="candidate_evaluator",
-            timeout=8.0,
-            max_retries=1,
-        )
-        self.llm = ChatOpenAI(
-            api_key=settings.llm_api_key,
-            base_url=settings.llm_base_url,
-            model=settings.llm_model,
-            temperature=0.0,
-            max_tokens=1400,
+        agent_config = get_agent_system_config()
+        definition = agent_config.services["candidate-evaluation"]
+        model_config = agent_config.model_profiles[definition.model_profile]
+        self.timeout = definition.runtime.timeout_seconds
+        self.rule_evaluator = RuleCandidateEvaluator()
+        self.llm = create_chat_model(
+            temperature=model_config.temperature,
+            max_tokens=model_config.max_tokens,
+            enable_thinking=False,
+            timeout=self.timeout,
+            max_retries=max(0, definition.runtime.max_attempts - 1),
         )
 
-    async def _execute(self, **kwargs: Any) -> CandidateEvaluationResult:
+    async def evaluate(self, **kwargs: Any) -> CandidateEvaluationResult:
+        started = time.perf_counter()
+        try:
+            result = await asyncio.wait_for(
+                self._evaluate(**kwargs), timeout=self.timeout
+            )
+        except Exception as exc:
+            result = CandidateEvaluationResult(
+                success=False, error=str(exc), confidence=0.0
+            )
+        products = {
+            product.product_id: product for product in kwargs.get("products", [])
+        }
+        for evaluation in result.evaluations:
+            product = products.get(evaluation.product_id)
+            if product is None:
+                continue
+            failures = hard_constraint_failures(product, kwargs.get("context") or {})
+            evaluation.unmet_constraints = list(
+                dict.fromkeys([*evaluation.unmet_constraints, *failures])
+            )
+            if evaluation.unmet_constraints:
+                evaluation.hard_constraints_passed = False
+        result.data["evaluations"] = [item.model_dump() for item in result.evaluations]
+        result.latency_ms = (time.perf_counter() - started) * 1000
+        return result
+
+    async def _evaluate(self, **kwargs: Any) -> CandidateEvaluationResult:
         context: dict[str, Any] = kwargs.get("context", {})
         products: list[Product] = kwargs.get("products", [])
         feedback: list[dict[str, Any]] = kwargs.get("feedback", [])
+        strategy = kwargs.get("strategy", "semantic")
+        if strategy not in {"semantic", "lightweight", "auto"}:
+            raise ValueError(f"未知候选评估模式: {strategy}")
+        if (
+            not feedback
+            and strategy in {"lightweight", "auto"}
+            and not self._is_complex_request(context)
+        ):
+            return self.rule_evaluator.evaluate(context=context, products=products)
 
         if not products:
             return CandidateEvaluationResult(
@@ -106,6 +143,7 @@ class CandidateEvaluatorAgent(BaseAgent):
             data={
                 "evaluations": [item.model_dump() for item in evaluations],
                 "feedback_applied": bool(feedback),
+                "evaluation_strategy": "semantic",
                 "evaluated_count": len(evaluations),
                 "candidate_count": len(products),
             },
@@ -166,9 +204,7 @@ class CandidateEvaluatorAgent(BaseAgent):
                     matched_preferences=self._string_list(
                         item.get("matched_preferences")
                     ),
-                    unmet_constraints=self._string_list(
-                        item.get("unmet_constraints")
-                    ),
+                    unmet_constraints=self._string_list(item.get("unmet_constraints")),
                     unverified_requirements=self._string_list(
                         item.get("unverified_requirements")
                     ),
@@ -194,9 +230,7 @@ class CandidateEvaluatorAgent(BaseAgent):
             if field not in _EVIDENCE_FIELDS or field in seen:
                 continue
             seen.add(field)
-            evidence.append(
-                ProductEvidence(field=field, value=product_data.get(field))
-            )
+            evidence.append(ProductEvidence(field=field, value=product_data.get(field)))
         return evidence
 
     def _fit_score(self, raw: Any) -> float:
@@ -209,3 +243,38 @@ class CandidateEvaluatorAgent(BaseAgent):
         if not isinstance(raw, list):
             return []
         return [str(item).strip() for item in raw if str(item).strip()]
+
+    @staticmethod
+    def _is_complex_request(context: dict[str, Any]) -> bool:
+        query = str(context.get("query") or context.get("keyword") or "")
+        goals = [
+            item
+            for item in context.get("shopping_goals") or []
+            if isinstance(item, dict)
+        ]
+        constraints = list(context.get("constraints") or [])
+        for goal in goals:
+            constraints.extend(goal.get("constraints") or [])
+        subjective_terms = (
+            "兼顾",
+            "权衡",
+            "更适合",
+            "比较",
+            "对比",
+            "区别",
+            "为什么",
+            "理由",
+            "舒适",
+            "音质",
+            "体验",
+            "敏感",
+            "风格",
+            "综合",
+        )
+        request_text = " ".join([query, *(str(item) for item in constraints)])
+        return (
+            len(goals) > 1
+            or len(constraints) > 2
+            or len(query) > 45
+            or any(term in request_text for term in subjective_terms)
+        )

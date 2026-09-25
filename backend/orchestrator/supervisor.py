@@ -8,19 +8,18 @@ import uuid
 from typing import Any
 
 import structlog
-from agents import (
-    CandidateEvaluatorAgent,
-    ProductRecAgent,
-    RecommendationCriticAgent,
-    ShoppingGuideAgent,
-)
+from agents import ProductRecAgent
+from agents.runtime import get_quality_reviewer, get_response_agent
+from core.agent_config import get_agent_system_config
+from services.candidate_evaluation import CandidateEvaluationService
+from services.product_constraints import hard_constraint_failures
 from models.schemas import (
     AgentResult,
     CandidateEvaluation,
-    CandidateEvaluationResult,
     Product,
     ProductRecResult,
-    RecommendationAuditResult,
+    QualityReviewResult,
+    ShoppingGuideResult,
     RecommendationRequest,
     RecommendationResponse,
 )
@@ -40,9 +39,9 @@ class SupervisorOrchestrator:
         sales_rag_service: SalesRagService | None = None,
     ):
         self.product_rec_agent = ProductRecAgent()
-        self.candidate_evaluator_agent = CandidateEvaluatorAgent()
-        self.recommendation_critic_agent = RecommendationCriticAgent()
-        self.shopping_guide_agent = ShoppingGuideAgent()
+        self.candidate_evaluation = CandidateEvaluationService()
+        self.quality_reviewer = get_quality_reviewer()
+        self.response_agent = get_response_agent()
         self.inventory_repository = InventoryRepository()
         self.ab_engine = ab_engine or ABTestEngine()
         self.sales_rag_service = sales_rag_service
@@ -75,10 +74,7 @@ class SupervisorOrchestrator:
         rec_result = await self._recommend_products(request)
         raw_products: list[Product] = getattr(rec_result, "products", [])
 
-        available_ids = await self._available_product_ids(raw_products)
-        candidate_products = [
-            product for product in raw_products if product.product_id in available_ids
-        ]
+        candidate_products = await self._filter_candidates(raw_products, request.context)
 
         guide_query = str(
             request.context.get("query")
@@ -86,7 +82,7 @@ class SupervisorOrchestrator:
             or request.scene
             or ""
         )
-        if self.sales_rag_service is not None:
+        if self.sales_rag_service is not None and candidate_products:
             augmented_context = await self.sales_rag_service.augment(
                 user_message=guide_query,
                 sales_context=request.context,
@@ -100,45 +96,31 @@ class SupervisorOrchestrator:
                 update={"context": augmented_context}
             )
 
-        evaluation_result, audit_result = await self._evaluate_candidates(
-            context=request.context,
-            products=candidate_products,
+        evaluation_result, guide_result, final_products = await self._draft_response(
+            request, candidate_products, rec_result,
         )
-        logger.info(
-            "supervisor.recommendation_audited",
-            request_id=request_id,
-            passed=self._audit_passed(audit_result),
-            revision_count=audit_result.data.get("revision_count", 0),
-            issue_count=len(audit_result.data.get("issues", [])),
+        audit_result = await self._review_response(
+            request.context, final_products, guide_result,
         )
-        if self._audit_passed(audit_result):
-            final_products = self._rank_evaluated_products(
-                candidate_products,
-                evaluation_result,
-            )[: request.num_items]
-        else:
-            final_products = candidate_products[: request.num_items]
-
-        request = request.model_copy(
-            update={
-                "context": {
-                    **request.context,
-                    "candidate_evaluations": evaluation_result.data.get(
-                        "evaluations", []
-                    ),
-                    "recommendation_audit": audit_result.data,
-                }
-            }
-        )
-        guide_result = await self.shopping_guide_agent.run(
-            query=guide_query,
-            context=request.context,
-            products=final_products,
-            requested_categories=rec_result.data.get("selected_categories", []),
-            requested_keywords=rec_result.data.get("selected_keywords", []),
-            image_summary=request.context.get("image_summary", ""),
-        )
-        copies = getattr(guide_result, "copies", [])
+        initial_issues = self._audit_issues(audit_result)
+        revision_count = 0
+        if (
+            get_agent_system_config().orchestration.max_replans > 0
+            and audit_result.success
+            and not self._audit_passed(audit_result)
+            and audit_result.retry_recommended
+        ):
+            evaluation_result, guide_result, final_products = await self._draft_response(
+                request, candidate_products, rec_result, feedback=initial_issues,
+            )
+            audit_result = await self._review_response(
+                request.context, final_products, guide_result,
+            )
+            revision_count = 1
+        audit_result.data.update({"revision_count": revision_count, "initial_issues": initial_issues})
+        final_products, guide_result = self._reviewed_output(final_products, guide_result, audit_result)
+        rec_result.data["candidate_evaluation"] = evaluation_result.data
+        copies = guide_result.copies
 
         total_latency = (time.perf_counter() - start) * 1000
 
@@ -158,89 +140,92 @@ class SupervisorOrchestrator:
             experiment_group=experiment.get("group", "control"),
             agent_results={
                 "product_rec": rec_result,
-                "candidate_evaluator": evaluation_result,
-                "recommendation_critic": audit_result,
-                "shopping_guide": guide_result,
+                "quality_reviewer": audit_result,
+                "response_generation": guide_result,
             },
             rag_trace=request.context.get("rag_trace") or {},
             citations=request.context.get("citations") or [],
             total_latency_ms=total_latency,
         )
 
-    async def _evaluate_candidates(
-        self,
-        context: dict[str, Any],
-        products: list[Product],
-    ) -> tuple[AgentResult, AgentResult]:
-        if not products:
-            evaluation_result = CandidateEvaluationResult(
-                success=True,
-                evaluations=[],
-                data={
-                    "evaluations": [],
-                    "candidate_count": 0,
-                    "revision_count": 0,
-                },
-                confidence=1.0,
-            )
-            audit_result = RecommendationAuditResult(
-                success=True,
-                passed=True,
-                retry_recommended=False,
-                issues=[],
-                data={
-                    "passed": True,
-                    "retry_recommended": False,
-                    "issues": [],
-                    "revision_count": 0,
-                    "max_revisions": 1,
-                    "initial_issues": [],
-                },
-                confidence=1.0,
-            )
-            return evaluation_result, audit_result
+    async def _filter_candidates(
+        self, products: list[Product], context: dict[str, Any],
+    ) -> list[Product]:
+        stock_map = await self.inventory_repository.get_stock_map(
+            [product.product_id for product in products]
+        ) if products else {}
+        current = [product.model_copy(update={"stock": stock_map.get(product.product_id, 0)}) for product in products]
+        return [product for product in current if not hard_constraint_failures(product, context)]
 
-        evaluation_result = await self.candidate_evaluator_agent.run(
-            context=context,
+    async def _draft_response(
+        self, request: RecommendationRequest, candidates: list[Product],
+        rec_result: ProductRecResult, feedback: list[dict[str, Any]] | None = None,
+    ) -> tuple[AgentResult, ShoppingGuideResult, list[Product]]:
+        evaluation = await self.candidate_evaluation.evaluate(
+            context=request.context, products=candidates,
+            strategy="semantic" if feedback else "auto", feedback=feedback or [],
+        )
+        if not evaluation.success:
+            return evaluation, ShoppingGuideResult(
+                success=False, error="候选评估未完成", confidence=0.0,
+            ), []
+        products = self._rank_evaluated_products(candidates, evaluation)[:request.num_items]
+        products = [product for product in products if not hard_constraint_failures(product, request.context)]
+        result = await self.response_agent.run(
+            query=str(request.context.get("query") or request.context.get("keyword") or request.scene),
+            context={**request.context, "candidate_evaluations": evaluation.data.get("evaluations", [])},
             products=products,
+            requested_categories=rec_result.data.get("selected_categories", []),
+            requested_keywords=rec_result.data.get("selected_keywords", []),
+            image_summary=request.context.get("image_summary", ""),
+            feedback=feedback or [],
         )
-        audit_result = await self.recommendation_critic_agent.run(
-            context=context,
+        if not isinstance(result, ShoppingGuideResult):
+            result = ShoppingGuideResult(success=False, error=result.error, confidence=0.0)
+        displayed = result.data.get("displayed_product_ids")
+        if isinstance(displayed, list):
+            products = [product for product in products if product.product_id in displayed]
+        return evaluation, result, products
+
+    async def _review_response(
+        self, context: dict[str, Any], products: list[Product], draft: ShoppingGuideResult,
+    ) -> QualityReviewResult:
+        return await self.quality_reviewer.run(
+            mode="recommendation",
+            context={
+                "query": context.get("query") or context.get("keyword") or "",
+                "shopping_goals": context.get("shopping_goals") or [],
+                "budget": context.get("budget"),
+                "constraints": context.get("constraints") or [],
+                "categories": context.get("categories") or [],
+                "category": context.get("category"),
+                "avoid_categories": context.get("avoid_categories") or [],
+                "skip_category_filter": context.get("skip_category_filter", False),
+                "image_summary": context.get("image_summary", ""),
+                "available_product_count": len(products),
+            },
             products=products,
-            evaluations=self._evaluations(evaluation_result),
+            evidence=context.get("rag_context") or [],
+            draft={
+                "answer": draft.answer if draft.success else "",
+                "product_copies": draft.copies,
+                "decision_summary": draft.data.get("decision_summary") or {},
+                "displayed_products": [product.model_dump() for product in products],
+            },
         )
-        initial_issues = self._audit_issues(audit_result)
-        revision_count = 0
 
-        if (
-            evaluation_result.success
-            and audit_result.success
-            and not self._audit_passed(audit_result)
-            and bool(getattr(audit_result, "retry_recommended", False))
-        ):
-            revised_result = await self.candidate_evaluator_agent.run(
-                context=context,
-                products=products,
-                feedback=initial_issues,
-            )
-            revision_count = 1
-            if revised_result.success:
-                evaluation_result = revised_result
-                audit_result = await self.recommendation_critic_agent.run(
-                    context=context,
-                    products=products,
-                    evaluations=self._evaluations(evaluation_result),
-                )
-
-        audit_result.data.update(
-            {
-                "revision_count": revision_count,
-                "max_revisions": 1,
-                "initial_issues": initial_issues,
-            }
+    def _reviewed_output(
+        self, products: list[Product], draft: ShoppingGuideResult, audit: AgentResult,
+    ) -> tuple[list[Product], ShoppingGuideResult]:
+        if self._audit_passed(audit) and draft.success:
+            return products, draft
+        return [], ShoppingGuideResult(
+            success=True,
+            answer="当前资料还不足以给出可靠建议，请补充商品或需求信息后再试。",
+            copies=[],
+            data={"displayed_product_ids": [], "review_blocked": True},
+            confidence=0.0,
         )
-        evaluation_result.data["revision_count"] = revision_count
-        return evaluation_result, audit_result
 
     def _evaluations(
         self,
@@ -284,6 +269,8 @@ class SupervisorOrchestrator:
     async def _recommend_products(
         self,
         request: RecommendationRequest,
+        *,
+        recall_mode: str = "hybrid",
     ) -> ProductRecResult:
         goals = self._shopping_goals(request.context)
         if len(goals) <= 1:
@@ -291,6 +278,7 @@ class SupervisorOrchestrator:
                 user_id=request.user_id,
                 context=request.context,
                 num_items=request.num_items * 2,
+                recall_mode=recall_mode,
             )
 
         per_goal_items = max(1, (request.num_items * 2 + len(goals) - 1) // len(goals))
@@ -300,6 +288,7 @@ class SupervisorOrchestrator:
                     user_id=request.user_id,
                     context=self._context_for_goal(request.context, goal),
                     num_items=per_goal_items,
+                    recall_mode=recall_mode,
                 )
                 for goal in goals
             ]
@@ -318,11 +307,11 @@ class SupervisorOrchestrator:
         return ProductRecResult(
             success=all(result.success for result in goal_results),
             products=merged_products[: request.num_items * 2],
-            recall_strategy="multi_goal",
+            recall_strategy=f"multi_goal_{recall_mode}",
             data={
                 "candidate_count": len(merged_products),
                 "reranked": len(merged_products),
-                "recall_reason": "multi_goal_recommendation",
+                "recall_reason": f"multi_goal_{recall_mode}_recommendation",
                 "goal_count": len(goals),
                 "goal_results": [
                     {
@@ -415,13 +404,3 @@ class SupervisorOrchestrator:
         if category:
             goal_context["categories"] = [category]
         return goal_context
-
-    async def _available_product_ids(self, products: list[Product]) -> set[str]:
-        stock_map = await self.inventory_repository.get_stock_map(
-            [product.product_id for product in products]
-        )
-        return {
-            product.product_id
-            for product in products
-            if stock_map.get(product.product_id, 0) > 0
-        }

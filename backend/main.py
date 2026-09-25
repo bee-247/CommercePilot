@@ -14,6 +14,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from api.router import api_router
+from core.application_state import adaptive_agent_mesh  # noqa: E402
 from core.auth import ensure_bootstrap_admin
 from core.config import get_settings
 from database import init_db
@@ -27,12 +28,17 @@ settings = get_settings()
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_db()
+    restored_agents = adaptive_agent_mesh.restore_persisted_metrics()
     ensure_bootstrap_admin()
     if settings.seed_demo_data:
         seeded = seed_demo_catalog()
         if seeded:
             logger.info("demo_catalog.seeded", product_count=seeded)
-    logger.info("app.startup", model=settings.llm_model)
+    logger.info(
+        "app.startup",
+        model=settings.text_llm,
+        restored_agent_metrics=restored_agents,
+    )
     yield
     logger.info("app.shutdown")
 

@@ -5,12 +5,10 @@ import os
 from collections.abc import Callable
 from typing import Any
 
+from core.config import get_settings
 from fastapi import APIRouter
 from fastapi.responses import JSONResponse
 from sqlalchemy import text
-
-from core.config import get_settings
-
 
 router = APIRouter(tags=["health"])
 
@@ -21,14 +19,14 @@ async def root_status():
     return {
         "name": "CommercePilot backend",
         "status": "ok",
-        "model": settings.llm_model,
+        "model": settings.text_llm,
     }
 
 
 @router.get("/health")
 async def health():
     settings = get_settings()
-    return {"status": "healthy", "model": settings.llm_model}
+    return {"status": "healthy", "model": settings.text_llm}
 
 
 def _check_sql(engine) -> None:
@@ -41,10 +39,15 @@ def _check_configuration() -> None:
     missing = []
     if len(os.getenv("JWT_SECRET_KEY", "")) < 32:
         missing.append("JWT_SECRET_KEY")
-    if not settings.llm_api_key or not settings.llm_model:
-        missing.append("ECOM_LLM_API_KEY/ECOM_LLM_MODEL")
-    if not os.getenv("ARK_API_KEY") or not os.getenv("MODEL"):
-        missing.append("ARK_API_KEY/MODEL")
+    model_fields = {
+        "text": ("llm", "api_key", "base_url"),
+        "vision": ("llm", "api_key", "base_url"),
+        "embedding": ("model", "api_key", "base_url"),
+    }
+    for role, fields in model_fields.items():
+        for field in fields:
+            if not getattr(settings, f"{role}_{field}"):
+                missing.append(f"{role.upper()}_{field.upper()}")
     if missing:
         raise ValueError("missing or invalid: " + ", ".join(missing))
 
@@ -89,5 +92,11 @@ async def readiness():
         content={
             "status": "ready" if ready else "not_ready",
             "components": components,
+            "models": {
+                "text": get_settings().text_llm,
+                "vision": get_settings().vision_llm,
+                "embedding": get_settings().embedding_model,
+                "reranker": get_settings().rerank_model,
+            },
         },
     )

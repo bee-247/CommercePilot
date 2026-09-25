@@ -8,13 +8,18 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
-
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 ENV_FILE = PROJECT_ROOT / ".env"
 
 
 def load_project_env() -> None:
     load_dotenv(ENV_FILE)
+
+
+def resolve_project_path(value: str | Path) -> Path:
+    """Resolve a configured relative path against the repository root."""
+    path = Path(value).expanduser()
+    return path if path.is_absolute() else PROJECT_ROOT / path
 
 
 def resolve_sqlite_url(url: str) -> str:
@@ -26,4 +31,4 @@ def resolve_sqlite_url(url: str) -> str:
     path = Path(raw_path)
     if path.is_absolute():
         return url
-    return f"{prefix}{(PROJECT_ROOT / path).resolve()}"
+    return f"{prefix}{resolve_project_path(path).resolve()}"

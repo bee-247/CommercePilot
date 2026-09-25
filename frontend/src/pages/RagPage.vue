@@ -94,7 +94,6 @@ onMounted(refreshSessions);
     <article class="panel conversation-panel">
       <div class="section-heading">
         <div>
-          <span class="eyebrow">KNOWLEDGE CHAT</span>
           <h2>RAG 问答</h2>
         </div>
         <span v-if="route" class="status-pill">{{ route }}</span>
@@ -102,12 +101,13 @@ onMounted(refreshSessions);
       <div v-if="sessions.length" class="session-strip">
         <article v-for="item in sessions" :key="item.session_id">
           <button class="text-button" @click="openSession(item)">
-            {{ item.session_id.slice(0, 12) }} · {{ item.message_count }} 条
+            {{ item.session_id.slice(0, 12) }} / {{ item.message_count }} 条
           </button>
           <button class="danger-link" @click="removeSession(item)">删除</button>
         </article>
       </div>
       <textarea
+        aria-label="知识库问题"
         v-model="question"
         class="question-input"
         rows="4"
@@ -119,7 +119,7 @@ onMounted(refreshSessions);
           {{ loading ? "检索中…" : "检索并回答" }}
         </button>
       </div>
-      <p v-if="error" class="error-text">{{ error }}</p>
+      <p v-if="error" class="error-text" role="alert">{{ error }}</p>
       <div v-if="answer" class="answer-block">{{ answer }}</div>
       <div v-else class="empty-state">回答及引用依据会显示在这里。</div>
     </article>
@@ -127,14 +127,13 @@ onMounted(refreshSessions);
     <aside class="panel trace-panel">
       <div class="section-heading">
         <div>
-          <span class="eyebrow">RAG TRACE</span>
           <h2>检索轨迹</h2>
         </div>
       </div>
       <template v-if="trace">
         <dl class="trace-facts">
-          <div><dt>模式</dt><dd>{{ trace.retrieval_mode || "—" }}</dd></div>
-          <div><dt>阶段</dt><dd>{{ trace.retrieval_stage || "—" }}</dd></div>
+          <div><dt>模式</dt><dd>{{ trace.retrieval_mode || "-" }}</dd></div>
+          <div><dt>阶段</dt><dd>{{ trace.retrieval_stage || "-" }}</dd></div>
           <div><dt>重写</dt><dd>{{ trace.rewrite_strategy || "未触发" }}</dd></div>
           <div><dt>Rerank</dt><dd>{{ trace.rerank_applied ? "已应用" : "未应用" }}</dd></div>
           <div><dt>Auto merge</dt><dd>{{ trace.auto_merge_applied ? "已应用" : "未应用" }}</dd></div>

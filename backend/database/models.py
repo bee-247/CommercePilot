@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import UTC, datetime
 
-from sqlalchemy import DateTime, Float, Integer, String, Text
+from sqlalchemy import Boolean, DateTime, Float, Integer, String, Text
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
@@ -17,15 +17,19 @@ class UserBase(DeclarativeBase):
 Base = ProductBase
 
 
+def _utc_now() -> datetime:
+    return datetime.now(UTC).replace(tzinfo=None)
+
+
 class ProductRecord(ProductBase):
     __tablename__ = "products"
 
     product_id: Mapped[str] = mapped_column(String(64), primary_key=True)
-    name: Mapped[str] = mapped_column(String(255), nullable=False)
+    name: Mapped[str] = mapped_column(Text, nullable=False)
     category: Mapped[str] = mapped_column(String(100), index=True, default="")
     price: Mapped[float] = mapped_column(Float, index=True, default=0.0)
     description: Mapped[str] = mapped_column(Text, default="")
-    brand: Mapped[str] = mapped_column(String(100), index=True, default="")
+    brand: Mapped[str] = mapped_column(Text, index=True, default="")
     seller_id: Mapped[str] = mapped_column(String(64), index=True, default="")
     tags_json: Mapped[str] = mapped_column(Text, default="[]")
     image_url: Mapped[str] = mapped_column(Text, default="")
@@ -144,3 +148,65 @@ class MemoryObservationRecord(UserBase):
     resolved_action: Mapped[str] = mapped_column(String(32), default="")
     resolution_reason: Mapped[str] = mapped_column(Text, default="")
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class AgentEvaluationRecord(UserBase):
+    """Append-only task evaluation used for Agent routing feedback."""
+
+    __tablename__ = "agent_evaluations"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    request_id: Mapped[str] = mapped_column(String(64), index=True)
+    user_id: Mapped[str] = mapped_column(String(64), index=True, default="")
+    scene: Mapped[str] = mapped_column(String(64), index=True, default="")
+    task_id: Mapped[str] = mapped_column(String(64), default="")
+    capability: Mapped[str] = mapped_column(String(64), index=True)
+    agent_id: Mapped[str] = mapped_column(String(96), index=True)
+    execution_success: Mapped[bool] = mapped_column(Boolean, default=False)
+    business_success: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    latency_ms: Mapped[float] = mapped_column(Float, default=0.0)
+    broker_score: Mapped[float] = mapped_column(Float, default=0.0)
+    historical_success_score: Mapped[float] = mapped_column(Float, default=0.0)
+    latency_score: Mapped[float] = mapped_column(Float, default=0.0)
+    cost_score: Mapped[float] = mapped_column(Float, default=0.0)
+    scenario_score: Mapped[float] = mapped_column(Float, default=0.0)
+    scenario_reason: Mapped[str] = mapped_column(Text, default="")
+    error: Mapped[str] = mapped_column(Text, default="")
+    replan_triggered: Mapped[bool] = mapped_column(Boolean, default=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime,
+        default=_utc_now,
+        index=True,
+    )
+
+
+class MeshEvaluationRecord(UserBase):
+    """One persistent quality summary for each Mesh recommendation request."""
+
+    __tablename__ = "mesh_evaluations"
+
+    request_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    user_id: Mapped[str] = mapped_column(String(64), index=True, default="")
+    scene: Mapped[str] = mapped_column(String(64), index=True, default="")
+    initial_judge_passed: Mapped[bool | None] = mapped_column(
+        Boolean,
+        nullable=True,
+    )
+    final_judge_passed: Mapped[bool | None] = mapped_column(
+        Boolean,
+        nullable=True,
+    )
+    business_success: Mapped[bool] = mapped_column(Boolean, default=False)
+    replan_triggered: Mapped[bool] = mapped_column(Boolean, default=False)
+    replan_recovered: Mapped[bool] = mapped_column(Boolean, default=False)
+    fallback: Mapped[bool] = mapped_column(Boolean, default=False)
+    total_latency_ms: Mapped[float] = mapped_column(Float, default=0.0)
+    task_count: Mapped[int] = mapped_column(Integer, default=0)
+    product_count: Mapped[int] = mapped_column(Integer, default=0)
+    issue_count: Mapped[int] = mapped_column(Integer, default=0)
+    trace_json: Mapped[str] = mapped_column(Text, default="{}")
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime,
+        default=_utc_now,
+        index=True,
+    )

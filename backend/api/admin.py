@@ -1,10 +1,13 @@
 """Administrative and indexing API routes."""
 
-from fastapi import APIRouter, Depends
-
-from core.application_state import ab_engine, metrics_collector, vector_indexing_service
+from core.application_state import (
+    ab_engine,
+    agent_evaluation_store,
+    metrics_collector,
+    vector_indexing_service,
+)
 from core.auth import require_admin
-
+from fastapi import APIRouter, Depends
 
 router = APIRouter(
     prefix="/api/v1",
@@ -43,6 +46,12 @@ async def get_metrics():
         "agents": metrics_collector.get_agent_stats(),
         "business": metrics_collector.get_business_stats(),
     }
+
+
+@router.get("/agent-evaluations")
+def get_agent_evaluations(days: int = 30):
+    """查看持久化的 Agent 运行、业务质量与 Replan 聚合指标。"""
+    return agent_evaluation_store.get_summary(days=days)
 
 
 @router.post("/vector-index/products")

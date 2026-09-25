@@ -11,18 +11,17 @@ import "./styles/app.css";
 
 type PageKey = "chat" | "documents";
 
-const allPages: Array<{ key: PageKey; label: string; note: string }> = [
-  { key: "chat", label: "导购对话", note: "Sales" },
-  { key: "documents", label: "资料库", note: "Documents" },
-];
-
 const currentPage = ref<PageKey>("chat");
 const account = ref<AuthResponse | null>(null);
 const hasToken = ref(Boolean(getAccessToken()));
-const requiresAuth = computed(() => currentPage.value !== "chat");
-const activePage = computed(
-  () =>
-    allPages.find((page) => page.key === currentPage.value) ?? allPages[0],
+const isAdmin = computed(() => account.value?.role === "admin");
+const activePageLabel = computed(() =>
+  currentPage.value === "documents" ? "资料库管理" : "智导",
+);
+const activePageTagline = computed(() =>
+  currentPage.value === "documents"
+    ? "维护平台客服回答所需的通用知识文档"
+    : "更懂需求的智能购物助手",
 );
 
 function authenticated(value: AuthResponse) {
@@ -30,10 +29,22 @@ function authenticated(value: AuthResponse) {
   hasToken.value = true;
 }
 
-function logout() {
+function clearAuthentication() {
   setAccessToken("");
   account.value = null;
   hasToken.value = false;
+}
+
+function logout() {
+  clearAuthentication();
+  currentPage.value = "chat";
+}
+
+function openDocuments() {
+  currentPage.value = "documents";
+}
+
+function openChat() {
   currentPage.value = "chat";
 }
 
@@ -53,56 +64,68 @@ onMounted(async () => {
 
 <template>
   <div class="app-shell">
-    <aside class="sidebar">
-      <div class="brand">
-        <div class="brand-mark">智</div>
-        <div>
-          <h1>智导</h1>
-          <p>CommercePilot</p>
-        </div>
-      </div>
-
-      <nav class="nav" aria-label="工作台导航">
-        <button
-          v-for="page in allPages"
-          :key="page.key"
-          class="nav-item"
-          :class="{ active: currentPage === page.key }"
-          @click="currentPage = page.key"
-        >
-          <span>{{ page.label }}</span>
-          <small>{{ page.note }}</small>
-        </button>
-      </nav>
-
-      <div class="sidebar-card">
-        <span class="label">当前账户</span>
-        <strong>{{ account?.username || (hasToken ? "已保存凭证" : "访客") }}</strong>
-        <button v-if="hasToken" class="text-button" @click="logout">退出登录</button>
-      </div>
-    </aside>
-
     <main class="main">
       <header class="topbar">
-        <div>
-          <span class="eyebrow">COMMERCEPILOT WORKSPACE</span>
-          <h1>{{ activePage.label }}</h1>
+        <div class="topbar-brand">
+          <div class="brand-mark" aria-hidden="true">智</div>
+          <div>
+            <span class="product-kicker">CommercePilot</span>
+            <h1>{{ activePageLabel }}</h1>
+            <p class="topbar-tagline">{{ activePageTagline }}</p>
+          </div>
         </div>
-        <div class="mode-indicator">
-          <span></span>
-          混合推荐与知识检索
+        <div class="topbar-center" aria-label="工作台状态">
+          <div class="topbar-signal" aria-hidden="true">
+            <i></i><i></i><i></i><i></i><i></i>
+          </div>
+          <div class="topbar-center-copy">
+            <strong>{{ currentPage === "chat" ? "智能导购空间" : "知识资料中枢" }}</strong>
+            <span>
+              {{ currentPage === "chat" ? "商品库与推荐引擎已连接" : "资料索引服务已就绪" }}
+            </span>
+          </div>
+          <span class="topbar-live"><b></b>在线</span>
+        </div>
+        <div class="topbar-actions">
+          <div v-if="currentPage === 'chat'" class="mode-indicator">
+            混合检索模式
+          </div>
+          <button
+            v-if="currentPage === 'chat'"
+            type="button"
+            class="admin-entry-button"
+            @click="openDocuments"
+          >
+            资料库
+          </button>
+          <template v-else>
+            <span v-if="isAdmin" class="admin-identity">
+              管理员 / {{ account?.username }}
+            </span>
+            <button type="button" class="admin-entry-button" @click="openChat">
+              返回导购
+            </button>
+            <button
+              v-if="isAdmin"
+              type="button"
+              class="text-button"
+              @click="logout"
+            >
+              退出登录
+            </button>
+          </template>
         </div>
       </header>
 
       <LoginPanel
-        v-if="requiresAuth && !hasToken"
+        v-if="currentPage === 'documents' && !isAdmin"
+        admin-only
         @authenticated="authenticated"
+        @unauthorized="clearAuthentication"
       />
       <template v-else>
-        <ChatPage
-          v-if="currentPage === 'chat'"
-          :user-id="account?.username || 'web_user'"
-        />
+        <!-- 导购是公开访客空间，不能随资料库管理员登录切换会话命名空间。 -->
+        <ChatPage v-if="currentPage === 'chat'" :user-id="'web_user'" />
         <DocumentsPage v-else />
       </template>
     </main>

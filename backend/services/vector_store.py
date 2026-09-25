@@ -3,8 +3,8 @@ from __future__ import annotations
 from typing import Any
 
 import structlog
-
 from core.config import get_settings
+from core.model_clients import embedding_collection_name
 
 logger = structlog.get_logger()
 
@@ -16,10 +16,10 @@ class MilvusVectorStore:
         settings = get_settings()
         self.host = settings.milvus_host
         self.port = settings.milvus_port
-        self.product_collection = (
+        self.product_collection = embedding_collection_name(
             settings.milvus_product_collection or settings.milvus_collection
         )
-        self.user_collection = settings.milvus_user_collection
+        self.user_collection = embedding_collection_name(settings.milvus_user_collection)
         self.dimension = settings.embedding_dimension
         self._connected = False
 
@@ -78,6 +78,17 @@ class MilvusVectorStore:
             id_field="product_id",
             id_value=product_id,
             embedding=embedding,
+        )
+
+    async def upsert_product_embeddings(
+        self,
+        rows: list[tuple[str, list[float]]],
+    ) -> bool:
+        """Write one product batch and make it durable with a single flush."""
+        return await self._upsert_embeddings(
+            collection_name=self.product_collection,
+            id_field="product_id",
+            rows=rows,
         )
 
     async def upsert_user_embedding(
@@ -166,16 +177,42 @@ class MilvusVectorStore:
         id_value: str,
         embedding: list[float],
     ) -> bool:
-        if not id_value or not embedding or not self._connect():
+        return await self._upsert_embeddings(
+            collection_name=collection_name,
+            id_field=id_field,
+            rows=[(id_value, embedding)],
+        )
+
+    async def _upsert_embeddings(
+        self,
+        collection_name: str,
+        id_field: str,
+        rows: list[tuple[str, list[float]]],
+    ) -> bool:
+        if (
+            not rows
+            or any(not id_value or not embedding for id_value, embedding in rows)
+            or not self._connect()
+        ):
             return False
 
         try:
             collection = self._ensure_collection(collection_name, id_field)
-            collection.upsert([[id_value], [embedding]])
+            collection.upsert(
+                [
+                    [id_value for id_value, _ in rows],
+                    [embedding for _, embedding in rows],
+                ]
+            )
             collection.flush()
             return True
         except Exception as exc:
-            logger.warning("milvus.upsert_failed", collection=collection_name, error=str(exc))
+            logger.warning(
+                "milvus.upsert_failed",
+                collection=collection_name,
+                count=len(rows),
+                error=str(exc),
+            )
             return False
 
     def _ensure_collection(self, collection_name: str, id_field: str):

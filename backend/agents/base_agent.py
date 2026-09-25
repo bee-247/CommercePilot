@@ -6,9 +6,8 @@ from abc import ABC, abstractmethod
 from typing import Any
 
 import structlog
-from tenacity import retry, stop_after_attempt, wait_exponential
-
 from models.schemas import AgentResult
+from tenacity import retry, stop_after_attempt, wait_exponential
 
 logger = structlog.get_logger()
 

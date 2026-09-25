@@ -1,6 +1,6 @@
 from typing import Literal, TypedDict, List, Optional
-import os
-from langchain.chat_models import init_chat_model
+from core.config import get_settings
+from core.model_clients import create_chat_model
 from pydantic import BaseModel, Field
 from ..utils.token_usage_tracker import record_active_session_token_usage_from_message
 
@@ -10,10 +10,7 @@ from core.env import load_project_env
 
 load_project_env()
 
-API_KEY = os.getenv("ARK_API_KEY")
-MODEL = os.getenv("MODEL")
-BASE_URL = os.getenv("BASE_URL")
-GRADE_MODEL = os.getenv("GRADE_MODEL", "gpt-4.1")
+_settings = get_settings()
 
 _grader_model = None
 _router_model = None
@@ -21,14 +18,10 @@ _router_model = None
 
 def _get_grader_model():
     global _grader_model
-    if not API_KEY or not GRADE_MODEL:
+    if not _settings.text_api_key or not _settings.text_llm:
         return None
     if _grader_model is None:
-        _grader_model = init_chat_model(
-            model=GRADE_MODEL,
-            model_provider="openai",
-            api_key=API_KEY,
-            base_url=BASE_URL,
+        _grader_model = create_chat_model(
             temperature=0,
             stream_usage=True,
         )
@@ -37,14 +30,10 @@ def _get_grader_model():
 
 def _get_router_model():
     global _router_model
-    if not API_KEY or not MODEL:
+    if not _settings.text_api_key or not _settings.text_llm:
         return None
     if _router_model is None:
-        _router_model = init_chat_model(
-            model=MODEL,
-            model_provider="openai",
-            api_key=API_KEY,
-            base_url=BASE_URL,
+        _router_model = create_chat_model(
             temperature=0,
             stream_usage=True,
         )

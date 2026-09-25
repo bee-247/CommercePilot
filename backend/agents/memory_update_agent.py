@@ -3,15 +3,13 @@ from __future__ import annotations
 import json
 from typing import Any
 
+from core.agent_config import get_agent_system_config
 from langchain_core.messages import HumanMessage, SystemMessage
-from langchain_openai import ChatOpenAI
-
-from core.config import get_settings
+from core.model_clients import create_chat_model
 from models.schemas import AgentResult
 from utils.json_utils import parse_json_object
 
 from .base_agent import BaseAgent
-
 
 EXTRACT_PROMPT = """你是电商长期记忆抽取Agent。你只输出JSON，不要解释。
 
@@ -84,14 +82,17 @@ RESOLVE_PROMPT = """你是电商长期记忆合并Agent。你只输出JSON，不
 
 class MemoryUpdateAgent(BaseAgent):
     def __init__(self):
-        settings = get_settings()
-        super().__init__(name="memory_update", timeout=8.0)
-        self.llm = ChatOpenAI(
-            api_key=settings.llm_api_key,
-            base_url=settings.llm_base_url,
-            model=settings.llm_model,
-            temperature=0.0,
-            max_tokens=900,
+        agent_config = get_agent_system_config()
+        definition = agent_config.agent("memory-update")
+        model_config = agent_config.resolved_model("memory-update")
+        super().__init__(
+            name="memory_update",
+            timeout=definition.runtime.timeout_seconds,
+            max_retries=definition.runtime.max_attempts,
+        )
+        self.llm = create_chat_model(
+            temperature=model_config.temperature,
+            max_tokens=model_config.max_tokens,
         )
 
     async def _execute(self, **kwargs: Any) -> AgentResult:

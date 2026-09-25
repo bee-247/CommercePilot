@@ -53,7 +53,6 @@ onMounted(refresh);
   <section class="stack">
     <article class="panel status-overview">
       <div>
-        <span class="eyebrow">SYSTEM STATUS</span>
         <h2>运行概览</h2>
       </div>
       <div class="health-card" :class="{ online: health?.status === 'healthy' }">
@@ -69,7 +68,6 @@ onMounted(refresh);
       </button>
     </article>
     <article class="panel">
-      <span class="eyebrow">READINESS</span>
       <h2>依赖就绪状态</h2>
       <div v-if="readiness" class="readiness-grid">
         <article
@@ -87,13 +85,11 @@ onMounted(refresh);
     </article>
     <div class="workspace-grid">
       <article class="panel">
-        <span class="eyebrow">METRICS</span>
         <h2>Agent 与业务指标</h2>
-        <p v-if="error" class="error-text">{{ error }}</p>
+        <p v-if="error" class="error-text" role="alert">{{ error }}</p>
         <pre class="json-output">{{ JSON.stringify(metrics, null, 2) }}</pre>
       </article>
       <article class="panel">
-        <span class="eyebrow">EXPERIMENTS</span>
         <h2>A/B 实验</h2>
         <pre class="json-output">{{ JSON.stringify(experiments, null, 2) }}</pre>
         <p v-if="indexResult" class="notice">

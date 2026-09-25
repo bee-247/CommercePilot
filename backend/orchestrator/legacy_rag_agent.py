@@ -1,15 +1,9 @@
-import os
 import json
 import asyncio
-from langchain.chat_models import init_chat_model
-from langchain.agents import create_agent
-from langchain_core.messages import HumanMessage, AIMessage, AIMessageChunk, SystemMessage
-from customer_service.agents.registry import get_customer_service_agent_specs
-from customer_service.agents.router import (
-    ServiceSubTask,
-    plan_customer_service_tasks,
-    route_customer_service_agent,
-)
+from agents.runtime import get_quality_reviewer, get_response_agent, get_understanding_agent
+from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
+from customer_service.agents.executor import CustomerServiceTaskContext
+from customer_service.task_schemas import ServiceSubTask
 from customer_service.tool_context import (
     reset_service_username,
     set_service_username,
@@ -34,9 +28,6 @@ from core.env import load_project_env
 
 load_project_env()
 
-API_KEY = os.getenv("ARK_API_KEY")
-MODEL = os.getenv("MODEL")
-BASE_URL = os.getenv("BASE_URL")
 
 class ConversationStorage:
     """对话存储（PostgreSQL + Redis）。"""
@@ -228,41 +219,13 @@ class ConversationStorage:
 
 
 
-def create_agent_instances():
-    model = init_chat_model(
-        model=MODEL,
-        model_provider="openai",
-        api_key=API_KEY,
-        base_url=BASE_URL,
-        temperature=0.3,
-        stream_usage=True,
-    )
-
-    agents = {
-        name: create_agent(
-            model=model,
-            tools=spec.tools,
-            system_prompt=spec.system_prompt,
-        )
-        for name, spec in get_customer_service_agent_specs().items()
-    }
-    return agents, model
-
-
-agents, model = create_agent_instances()
-
-
-def _select_agent(user_text: str):
-    route = route_customer_service_agent(user_text)
-    return agents.get(route) or agents["general"], route
+response_agent = get_response_agent()
+service_agent = response_agent.build_customer_service_graph()
+model = response_agent.llm
 
 
 def _plan_agent_tasks(user_text: str) -> list[ServiceSubTask]:
-    tasks = plan_customer_service_tasks(user_text)
-    if not tasks:
-        _, route = _select_agent(user_text)
-        return [ServiceSubTask(route=route, instruction=user_text)]
-    return tasks
+    return get_understanding_agent().plan_customer_service_tasks(user_text)
 
 
 def _extract_response_content(result) -> str:
@@ -283,6 +246,42 @@ def _record_result_token_usage(user_id: str, session_id: str, result) -> None:
         record_token_usage_from_messages(user_id, session_id, result["messages"])
     else:
         record_token_usage_from_message(user_id, session_id, result)
+
+
+REVIEW_FALLBACK = "当前资料不足以给出可靠答复，请补充相关信息或联系人工客服确认。"
+
+
+def _tool_evidence(result) -> list[dict]:
+    evidence = []
+    for message in result.get("messages", []) if isinstance(result, dict) else []:
+        if getattr(message, "type", "") != "tool":
+            continue
+        raw = getattr(message, "content", "")
+        try:
+            parsed = json.loads(raw) if isinstance(raw, str) else None
+        except (TypeError, ValueError):
+            parsed = None
+        if isinstance(parsed, dict) and isinstance(parsed.get("context_chunks"), list):
+            evidence.extend(parsed["context_chunks"])
+        elif raw:
+            evidence.append({"tool": getattr(message, "name", ""), "text": raw})
+    return evidence
+
+
+def _review_arguments(user_text, task, draft, evidence):
+    return {
+        "mode": "customer_service",
+        "context": {"request": user_text, "task": task.instruction, "task_type": task.route},
+        "draft": draft, "evidence": evidence,
+    }
+
+
+def _revision_messages(result, audit):
+    feedback = json.dumps([issue.model_dump() for issue in audit.issues], ensure_ascii=False)
+    return result["messages"] + [HumanMessage(content=(
+        "请根据审核反馈修订刚才的最终答复，直接输出修订结果，不描述审核流程。"
+        "保留原任务要求，优先使用已有工具证据。审核反馈：" + feedback
+    ))]
 
 
 def _task_messages(base_messages: list, original_text: str, task: ServiceSubTask, previous_outputs: list[str]) -> list:
@@ -372,15 +371,30 @@ def chat_with_agent(user_text: str, user_id: str = "default_user", session_id: s
     context_token = set_service_username(user_id)
     task_results = []
     previous_outputs = []
+    evidence = []
     try:
         for task in task_plan:
-            selected_agent = agents.get(task.route) or agents["general"]
-            result = selected_agent.invoke(
+            result = service_agent.invoke(
                 {"messages": _task_messages(messages, user_text, task, previous_outputs)},
                 config={"recursion_limit": 8},
+                context=CustomerServiceTaskContext(route=task.route),
             )
-            response_part = _extract_response_content(result)
             _record_result_token_usage(user_id, session_id, result)
+            evidence.extend(_tool_evidence(result))
+            response_part = _extract_response_content(result)
+            reviewer = get_quality_reviewer()
+            audit = reviewer.review_sync(**_review_arguments(user_text, task, response_part, evidence))
+            if audit.success and not audit.passed and audit.retry_recommended:
+                result = service_agent.invoke(
+                    {"messages": _revision_messages(result, audit)},
+                    config={"recursion_limit": 8}, context=CustomerServiceTaskContext(route=task.route),
+                )
+                _record_result_token_usage(user_id, session_id, result)
+                evidence.extend(_tool_evidence(result))
+                response_part = _extract_response_content(result)
+                audit = reviewer.review_sync(**_review_arguments(user_text, task, response_part, evidence))
+            if not audit.success or not audit.passed:
+                response_part = REVIEW_FALLBACK
             task_results.append((task, response_part))
             previous_outputs.append(response_part)
     finally:
@@ -434,7 +448,7 @@ async def chat_with_agent_stream(user_text: str, user_id: str = "default_user", 
 
     messages.append(HumanMessage(content=user_text))
     usage_token = set_active_token_usage_session(user_id, session_id)
-    task_plan = _plan_agent_tasks(user_text)
+    task_plan = await asyncio.to_thread(_plan_agent_tasks, user_text)
     _log_task_plan(task_plan)
 
     full_response = ""
@@ -444,6 +458,7 @@ async def chat_with_agent_stream(user_text: str, user_id: str = "default_user", 
         nonlocal full_response
         context_token = set_service_username(user_id)
         previous_outputs = []
+        evidence = []
         try:
             await output_queue.put({"type": "task_plan", "tasks": _task_plan_payload(task_plan)})
             await output_queue.put({"type": "agent_route", "agent_route": _route_summary(task_plan)})
@@ -451,7 +466,6 @@ async def chat_with_agent_stream(user_text: str, user_id: str = "default_user", 
             full_response += plan_text
             await output_queue.put({"type": "content", "content": plan_text})
             for index, task in enumerate(task_plan, start=1):
-                selected_agent = agents.get(task.route) or agents["general"]
                 await output_queue.put(
                     {
                         "type": "task_start",
@@ -466,32 +480,29 @@ async def chat_with_agent_stream(user_text: str, user_id: str = "default_user", 
                     full_response += heading
                     await output_queue.put({"type": "content", "content": heading})
 
-                task_output = ""
-                async for msg, metadata in selected_agent.astream(
+                result = await service_agent.ainvoke(
                     {"messages": _task_messages(messages, user_text, task, previous_outputs)},
-                    stream_mode="messages",
-                    config={"recursion_limit": 8},
-                ):
-                    record_token_usage_from_message(user_id, session_id, msg)
-                    if not isinstance(msg, AIMessageChunk):
-                        continue
-                    if getattr(msg, "tool_call_chunks", None):
-                        continue
-
-                    content = ""
-                    if isinstance(msg.content, str):
-                        content = msg.content
-                    elif isinstance(msg.content, list):
-                        for block in msg.content:
-                            if isinstance(block, str):
-                                content += block
-                            elif isinstance(block, dict) and block.get("type") == "text":
-                                content += block.get("text", "")
-
-                    if content:
-                        task_output += content
-                        full_response += content
-                        await output_queue.put({"type": "content", "content": content})
+                    config={"recursion_limit": 8}, context=CustomerServiceTaskContext(route=task.route),
+                )
+                _record_result_token_usage(user_id, session_id, result)
+                evidence.extend(_tool_evidence(result))
+                task_output = _extract_response_content(result)
+                await output_queue.put({"type": "rag_step", "step": {"icon": "✓", "label": "审核回复", "detail": "核对事实依据和用户需求"}})
+                reviewer = get_quality_reviewer()
+                audit = await reviewer.run(**_review_arguments(user_text, task, task_output, evidence))
+                if audit.success and not audit.passed and audit.retry_recommended:
+                    result = await service_agent.ainvoke(
+                        {"messages": _revision_messages(result, audit)},
+                        config={"recursion_limit": 8}, context=CustomerServiceTaskContext(route=task.route),
+                    )
+                    _record_result_token_usage(user_id, session_id, result)
+                    evidence.extend(_tool_evidence(result))
+                    task_output = _extract_response_content(result)
+                    audit = await reviewer.run(**_review_arguments(user_text, task, task_output, evidence))
+                if not audit.success or not audit.passed:
+                    task_output = REVIEW_FALLBACK
+                full_response += task_output
+                await output_queue.put({"type": "content", "content": task_output})
 
                 previous_outputs.append(task_output)
                 if len(task_plan) > 1 and index < len(task_plan):

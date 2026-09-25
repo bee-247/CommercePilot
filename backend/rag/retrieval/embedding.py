@@ -7,40 +7,34 @@ import threading
 from collections import Counter
 from pathlib import Path
 
-from langchain_huggingface import HuggingFaceEmbeddings
-from core.env import PROJECT_ROOT, load_project_env
+from core.env import load_project_env, resolve_project_path
+from core.model_clients import embedding_index_id
+from services.embedding import EmbeddingService as DenseEmbeddingService
 
 load_project_env()
 
-_DEFAULT_STATE_PATH = Path(__file__).resolve().parent.parent / "data" / "bm25_state.json"
+_DEFAULT_STATE_PATH = Path("data/bm25_state.json")
 
 
-def _create_dense_embedder() -> HuggingFaceEmbeddings:
-    model_name = os.getenv("EMBEDDING_MODEL", "BAAI/bge-m3")
-    device = os.getenv("EMBEDDING_DEVICE", "cpu")
-    return HuggingFaceEmbeddings(
-        model_name=model_name,
-        model_kwargs={"device": device},
-        encode_kwargs={"normalize_embeddings": True},
-    )
+def _create_dense_embedder() -> DenseEmbeddingService:
+    return DenseEmbeddingService()
 
 
 class EmbeddingService:
-    """文本向量化服务 - 密集向量本地模型 + BM25 稀疏向量（持久化统计）"""
+    """统一 Embedding 模型 + BM25 稀疏向量（持久化统计）。"""
 
     def __init__(self, state_path: Path | str | None = None):
-        # Loading BGE can download and allocate a large model. Keep application
-        # startup lightweight and initialize it on the first embedding request.
-        self._embedder: HuggingFaceEmbeddings | None = None
+        # Model clients are lazy; constructing the service performs no API calls.
+        self._embedder: DenseEmbeddingService | None = None
         self._embedder_lock = threading.Lock()
         configured_path = Path(
             state_path or os.getenv("BM25_STATE_PATH", _DEFAULT_STATE_PATH)
         )
-        self._state_path = (
-            configured_path
-            if configured_path.is_absolute()
-            else PROJECT_ROOT / configured_path
-        )
+        if state_path is None:
+            configured_path = configured_path.with_name(
+                f"{configured_path.stem}_e{embedding_index_id()}{configured_path.suffix}"
+            )
+        self._state_path = resolve_project_path(configured_path)
         self._lock = threading.Lock()
 
         # BM25 参数
@@ -146,9 +140,9 @@ class EmbeddingService:
         try:
             return self._get_embedder().embed_documents(texts)
         except Exception as e:
-            raise Exception(f"本地嵌入模型调用失败: {str(e)}") from e
+            raise Exception(f"统一 Embedding 模型调用失败: {str(e)}") from e
 
-    def _get_embedder(self) -> HuggingFaceEmbeddings:
+    def _get_embedder(self) -> DenseEmbeddingService:
         if self._embedder is not None:
             return self._embedder
         with self._embedder_lock:

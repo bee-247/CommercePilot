@@ -5,11 +5,9 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-from fastapi import BackgroundTasks, HTTPException, UploadFile
-from sqlalchemy.orm import Session
-
 from core.config import get_settings
-from repositories.rag_resource_repository import RagResourceRepository
+from core.env import resolve_project_path
+from fastapi import BackgroundTasks, HTTPException, UploadFile
 from rag.ingestion.upload_jobs import (
     DELETE_STEPS,
     delete_job_manager,
@@ -17,6 +15,7 @@ from rag.ingestion.upload_jobs import (
 )
 from rag.storage.milvus_client import MilvusManager
 from rag.storage.models import Resource, User
+from repositories.rag_resource_repository import RagResourceRepository
 from schemas.rag_schemas import (
     DocumentDeleteJobResponse,
     DocumentDeleteResponse,
@@ -27,13 +26,12 @@ from schemas.rag_schemas import (
     DocumentUploadResponse,
     DocumentUploadStartResponse,
 )
+from sqlalchemy.orm import Session
 
 from .document_delete_processor import DocumentDeleteProcessor
 from .document_upload_processor import DocumentUploadProcessor
 
-
-DATA_DIR = Path(__file__).resolve().parents[3] / "data"
-UPLOAD_DIR = DATA_DIR / "documents"
+UPLOAD_DIR = resolve_project_path("data/documents")
 
 resource_repository = RagResourceRepository()
 upload_processor = DocumentUploadProcessor(

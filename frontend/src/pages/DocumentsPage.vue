@@ -12,8 +12,7 @@ import type { DocumentInfo, DocumentJob } from "../api/types";
 
 const documents = ref<DocumentInfo[]>([]);
 const selectedFile = ref<File | null>(null);
-const category = ref("");
-const brand = ref("");
+const fileInput = ref<HTMLInputElement | null>(null);
 const loading = ref(false);
 const message = ref("");
 const error = ref("");
@@ -45,13 +44,12 @@ async function upload() {
   error.value = "";
   try {
     const result = await uploadDocument(selectedFile.value, {
-      category: category.value,
-      brand: brand.value,
       business_line: "customer_service",
-      document_type: "product",
+      document_type: "general",
     });
     message.value = `${result.message}（任务 ${result.job_id.slice(0, 8)}）`;
     selectedFile.value = null;
+    if (fileInput.value) fileInput.value.value = "";
     await pollJob(result.job_id, "upload");
   } catch (cause) {
     error.value = cause instanceof Error ? cause.message : "上传失败";
@@ -105,28 +103,41 @@ onMounted(refresh);
     <article class="panel upload-panel">
       <div class="section-heading">
         <div>
-          <span class="eyebrow">INGESTION</span>
-          <h2>上传知识资料</h2>
+          <h2>上传知识文档</h2>
+          <p class="muted">用于平台客服回答的通用资料，例如平台规则、常见问题和售后流程。</p>
         </div>
       </div>
       <div class="form-grid">
-        <label>商品类目<input v-model="category" placeholder="例如：耳机" /></label>
-        <label>品牌<input v-model="brand" placeholder="例如：Acme" /></label>
         <label class="file-field">
-          文件
-          <input type="file" accept=".pdf,.doc,.docx,.xls,.xlsx" @change="pickFile" />
+          选择文档
+          <input
+            ref="fileInput"
+            type="file"
+            accept=".pdf,.doc,.docx,.xls,.xlsx"
+            aria-describedby="document-format-hint"
+            :disabled="loading"
+            @change="pickFile"
+          />
+          <span id="document-format-hint" class="muted">支持 PDF、Word、Excel，每次上传一个文件。</span>
         </label>
-        <button class="primary" :disabled="loading" @click="upload">开始后台入库</button>
+        <button class="primary" :disabled="loading || !selectedFile" @click="upload">上传并入库</button>
       </div>
       <p v-if="message" class="success-text">{{ message }}</p>
-      <p v-if="error" class="error-text">{{ error }}</p>
+      <p v-if="error" class="error-text" role="alert">{{ error }}</p>
       <div v-if="activeJobs.length" class="job-list">
         <article v-for="job in activeJobs" :key="job.job_id">
           <div>
             <strong>{{ job.filename }}</strong>
             <span>{{ job.message }}</span>
           </div>
-          <div class="progress-track">
+          <div
+            class="progress-track"
+            role="progressbar"
+            aria-label="入库进度"
+            aria-valuemin="0"
+            aria-valuemax="100"
+            :aria-valuenow="Math.max(...job.steps.map((step) => step.percent), 0)"
+          >
             <span
               :style="{
                 width: `${Math.max(...job.steps.map((step) => step.percent), 0)}%`,
@@ -140,7 +151,6 @@ onMounted(refresh);
     <article class="panel">
       <div class="section-heading">
         <div>
-          <span class="eyebrow">KNOWLEDGE BASE</span>
           <h2>资料库</h2>
         </div>
         <button class="secondary" :disabled="loading" @click="refresh">刷新</button>
@@ -152,7 +162,7 @@ onMounted(refresh);
         <div v-for="document in documents" :key="document.filename" class="table-row">
           <div>
             <strong>{{ document.display_name || document.filename }}</strong>
-            <small>{{ document.category || "未分类" }} · {{ document.brand || "未指定品牌" }}</small>
+            <small>{{ document.file_type?.replace(/^\./, "").toUpperCase() || "文档" }}</small>
           </div>
           <span>{{ document.visibility || "public" }}</span>
           <span>{{ document.chunk_count }}</span>
@@ -166,7 +176,7 @@ onMounted(refresh);
           </button>
         </div>
       </div>
-      <div v-else class="empty-state">{{ loading ? "正在加载…" : "还没有可见资料。" }}</div>
+      <div v-else class="empty-state">{{ loading ? "正在加载…" : "暂无知识文档，可上传平台规则、常见问题或售后流程。" }}</div>
     </article>
   </section>
 </template>

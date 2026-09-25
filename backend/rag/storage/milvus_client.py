@@ -5,6 +5,8 @@ from typing import Callable, TypeVar
 
 from pymilvus import MilvusClient, DataType, AnnSearchRequest, RRFRanker
 from core.env import load_project_env
+from core.config import get_settings
+from core.model_clients import embedding_collection_name
 
 load_project_env()
 
@@ -19,7 +21,9 @@ class MilvusManager:
     def __init__(self):
         self.host = os.getenv("MILVUS_HOST", "localhost")
         self.port = os.getenv("MILVUS_PORT", "19530")
-        self.collection_name = os.getenv("MILVUS_COLLECTION", "embeddings_collection")
+        self.collection_name = embedding_collection_name(
+            os.getenv("MILVUS_COLLECTION", "embeddings_collection")
+        )
         self.uri = f"http://{self.host}:{self.port}"
         self.client = None
         self._client_lock = threading.RLock()
@@ -70,10 +74,12 @@ class MilvusManager:
     def init_collection(self, dense_dim: int | None = None):
         """
         初始化 Milvus 集合 - 同时支持密集向量和稀疏向量
-        :param dense_dim: 密集向量维度；默认读环境变量 DENSE_EMBEDDING_DIM（本地 BAAI/bge-m3 为 1024）
+        :param dense_dim: 密集向量维度，必须与统一 Embedding 配置一致。
         """
         if dense_dim is None:
-            dense_dim = int(os.getenv("DENSE_EMBEDDING_DIM", "1024"))
+            dense_dim = get_settings().embedding_dimension
+        if dense_dim != get_settings().embedding_dimension:
+            raise ValueError("dense_dim 与统一 Embedding 配置不一致")
         def _init(client: MilvusClient) -> None:
             if not client.has_collection(self.collection_name):
                 schema = client.create_schema(auto_id=True, enable_dynamic_field=True)

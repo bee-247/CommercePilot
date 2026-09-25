@@ -1,13 +1,12 @@
 from __future__ import annotations
 
 import json
-from typing import Iterable
-
-from sqlalchemy import desc, distinct, or_, select
+from collections.abc import Iterable
 
 from database.models import InventoryRecord, ProductRecord
 from database.session import ProductSessionLocal
 from models.schemas import Product, UserProfile
+from sqlalchemy import desc, distinct, or_, select
 
 
 class ProductRepository:
@@ -73,6 +72,7 @@ class ProductRepository:
                 conditions.extend(
                     [
                         ProductRecord.name.like(pattern),
+                        ProductRecord.brand.like(pattern),
                         ProductRecord.category.like(pattern),
                         ProductRecord.tags_json.like(pattern),
                     ]

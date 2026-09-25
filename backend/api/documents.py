@@ -3,7 +3,7 @@
 from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, UploadFile
 from sqlalchemy.orm import Session
 
-from core.auth import get_current_user, get_db
+from core.auth import get_db, require_admin
 from rag.storage.models import User
 from schemas.rag_schemas import (
     DocumentDeleteJobResponse,
@@ -21,7 +21,7 @@ router = APIRouter(tags=["documents"])
 
 
 @router.get("/documents", response_model=DocumentListResponse)
-async def list_documents(current_user: User = Depends(get_current_user)):
+async def list_documents(current_user: User = Depends(require_admin)):
     return await document_service.list_documents(current_user=current_user)
 
 
@@ -35,7 +35,7 @@ async def upload_document_async(
     document_type: str = Form("product"),
     section_title: str = Form(""),
     product_tags: str = Form(""),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_admin),
     db: Session = Depends(get_db),
 ):
     return await document_service.upload_document_async(
@@ -55,7 +55,7 @@ async def upload_document_async(
 @router.get("/documents/upload/jobs/{job_id}", response_model=DocumentUploadJobResponse)
 async def get_upload_job(
     job_id: str,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_admin),
 ):
     return await document_service.get_upload_job(
         job_id=job_id,
@@ -64,7 +64,7 @@ async def get_upload_job(
 
 
 @router.get("/documents/upload/jobs", response_model=list[DocumentUploadJobResponse])
-async def list_upload_jobs(current_user: User = Depends(get_current_user)):
+async def list_upload_jobs(current_user: User = Depends(require_admin)):
     return await document_service.list_upload_jobs(current_user=current_user)
 
 
@@ -72,7 +72,7 @@ async def list_upload_jobs(current_user: User = Depends(get_current_user)):
 async def delete_document_async(
     filename: str,
     background_tasks: BackgroundTasks,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_admin),
 ):
     return await document_service.delete_document_async(
         filename=filename,
@@ -84,7 +84,7 @@ async def delete_document_async(
 @router.get("/documents/delete/jobs/{job_id}", response_model=DocumentDeleteJobResponse)
 async def get_delete_job(
     job_id: str,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_admin),
 ):
     return await document_service.get_delete_job(
         job_id=job_id,
@@ -101,7 +101,7 @@ async def upload_document(
     document_type: str = Form("product"),
     section_title: str = Form(""),
     product_tags: str = Form(""),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_admin),
     db: Session = Depends(get_db),
 ):
     return await document_service.upload_document(
@@ -120,7 +120,7 @@ async def upload_document(
 @router.delete("/documents/{filename}", response_model=DocumentDeleteResponse)
 async def delete_document(
     filename: str,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_admin),
 ):
     return await document_service.delete_document(
         filename=filename,

@@ -3,12 +3,9 @@
 from __future__ import annotations
 
 import json
-import os
 from typing import Any
 
-from langchain.chat_models import init_chat_model
-from pydantic import BaseModel
-
+from agents.runtime import get_quality_reviewer, get_response_agent
 from customer_service.generation_tools import (
     prepare_faq,
     prepare_reply_review,
@@ -23,38 +20,9 @@ from customer_service.tool_context import (
     reset_service_username,
     set_service_username,
 )
+from pydantic import BaseModel
 from rag.storage.database import SessionLocal
 from rag.storage.models import ServiceArtifact, User
-
-
-_generation_model = None
-_verifier_model = None
-
-
-def _model(temperature: float):
-    return init_chat_model(
-        model=os.getenv("MODEL"),
-        model_provider="openai",
-        api_key=os.getenv("ARK_API_KEY"),
-        base_url=os.getenv("BASE_URL"),
-        temperature=temperature,
-        stream_usage=True,
-    )
-
-
-def _get_generation_model():
-    global _generation_model
-    if _generation_model is None:
-        _generation_model = _model(0.2)
-    return _generation_model
-
-
-def _get_verifier_model():
-    global _verifier_model
-    if _verifier_model is None:
-        _verifier_model = _model(0)
-    return _verifier_model
-
 
 def _tool_payload(tool, arguments: dict) -> dict:
     raw = tool.invoke(arguments)
@@ -83,36 +51,12 @@ def _source_ids(payload: dict) -> list[str]:
     )
 
 
-def _generate(task_name: str, payload: dict, schema: type[BaseModel]) -> dict:
-    prompt = f"""
-你是智导（CommercePilot）系统的{task_name} Agent。请严格依据上下文生成结构化结果。
-
-规则：
-1. 不得虚构商品参数、库存、价格、优惠、物流时效或售后承诺。
-2. 证据不足时写入 limitation，并指出需要人工确认的内容。
-3. 表达自然、简洁、合规，不使用绝对化或施压式销售话术。
-4. source_chunk_ids 只能来自 context_chunks。
-
-任务上下文：
-{json.dumps(payload, ensure_ascii=False, indent=2)}
-""".strip()
-    result = _get_generation_model().with_structured_output(schema).invoke(
-        [{"role": "user", "content": prompt}]
+def _generate(task_name: str, payload: dict, schema: type[BaseModel], *, feedback=None, previous_content=None) -> dict:
+    if schema is ReplyReviewOutput:
+        return get_quality_reviewer().generate_report(payload, feedback)
+    return get_response_agent().generate_structured(
+        task_name, payload, schema, feedback=feedback, previous_content=previous_content,
     )
-    return result.model_dump() if isinstance(result, BaseModel) else dict(result)
-
-
-def _verify(task_name: str, content: dict, source_ids: list[str]) -> str:
-    prompt = f"""
-你是客服质量校验 Agent。检查以下{task_name}是否存在事实编造、无依据承诺、
-遗漏客户需求、过度营销或引用不一致。用三条以内中文短句给出结论；
-没有问题时输出“校验通过”。
-
-允许的 source_chunk_ids：{source_ids}
-内容：{json.dumps(content, ensure_ascii=False)}
-""".strip()
-    response = _get_verifier_model().invoke(prompt)
-    return str(getattr(response, "content", response)).strip()
 
 
 def _save(
@@ -157,7 +101,22 @@ def _response(
 ) -> dict:
     content = _generate(task_name, payload, schema)
     source_ids = _source_ids(payload)
-    notes = _verify(task_name, content, source_ids)
+    reviewer = get_quality_reviewer()
+    review_args = {
+        "mode": "customer_service",
+        "context": {"task": task_name, "requirements": payload.get("requirements"), "inputs": payload.get("inputs")},
+        "evidence": _source_chunks(payload),
+    }
+    audit = reviewer.review_sync(draft=content, **review_args)
+    if audit.success and not audit.passed and audit.retry_recommended:
+        content = _generate(
+            task_name, payload, schema,
+            feedback=[issue.model_dump() for issue in audit.issues], previous_content=content,
+        )
+        audit = reviewer.review_sync(draft=content, **review_args)
+    if not audit.success or not audit.passed:
+        raise ValueError("生成内容未通过质量审核，未保存或交付草稿；请补充资料后重试")
+    notes = "校验通过"
     saved_id = (
         _save(
             username,
@@ -196,7 +155,7 @@ def generate_faq(request: Any, username: str) -> dict:
         task_name="FAQ 生成",
         payload=payload,
         schema=FaqSetOutput,
-        route="supervisor -> faq_specialist -> verifier",
+        route="response-generation(faq) -> quality-reviewer",
     )
 
 
@@ -214,7 +173,7 @@ def generate_sales_script(request: Any, username: str) -> dict:
         task_name="导购话术生成",
         payload=payload,
         schema=SalesScriptOutput,
-        route="supervisor -> sales_script_specialist -> verifier",
+        route="response-generation(sales_script) -> quality-reviewer",
     )
 
 
@@ -232,5 +191,5 @@ def review_service_reply(request: Any, username: str) -> dict:
         task_name="客服回复质检",
         payload=payload,
         schema=ReplyReviewOutput,
-        route="supervisor -> quality_reviewer -> verifier",
+        route="quality-reviewer(reply_review) -> quality-reviewer(final_check)",
     )
