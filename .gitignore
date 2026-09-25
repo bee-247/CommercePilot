@@ -20,15 +20,8 @@ htmlcov/
 node_modules/
 frontend/dist/
 
-data/documents/*
-!data/documents/.gitkeep
-data/uploads/*
-!data/uploads/.gitkeep
-data/knowledge_base/*
-!data/knowledge_base/.gitkeep
-data/indexes/*
-!data/indexes/.gitkeep
-data/bm25_state.json
-
 logs/*
 !logs/.gitkeep
+
+/data/
+/model/
